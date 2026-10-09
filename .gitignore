@@ -15,3 +15,7 @@ backend.hcl
 
 .DS_Store
 plan.log
+
+
+# Local settings for bootstrap/github/setup.sh
+bootstrap/github/*.env

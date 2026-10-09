@@ -4,47 +4,103 @@
 # Every step is idempotent; re-run it to repair drift or to add new org
 # members to the team.
 #
-#   bootstrap/github/setup.sh <config.env> [step ...]
+#   GH_ORG=<org> GH_REPO=<repo> [SETTING=value ...] bootstrap/github/setup.sh [step ...]
+#
+# Settings come from environment variables. The `variables` step stores them
+# as Actions variables on the repository, and later runs read any setting not
+# set in the environment from there, so only GH_ORG and GH_REPO are needed:
+#
+#   GH_ORG               GitHub organization (required)
+#   GH_REPO              repository name (required)
+#   GH_APPROVER          comma-separated users who approve PRs and applies
+#                        (required on first run); any one approval is enough
+#   GH_VISIBILITY        public | private (default public; private needs a paid
+#                        GitHub plan for the approval gates)
+#   GH_TEAM              team of org members with Write (default <repo>)
+#   GH_APPROVER_TEAM     team of just the approvers, may bypass review via PR
+#                        (default <repo>-approvers)
+#   APPLY_ENVIRONMENT    environment the apply runs in (default production)
+#   AWS_REGION           default us-east-1
+#   STATE_KEY            must match accounts/versions.tf (default permissions/terraform.tfstate)
+#   EXECUTION_ROLE_NAME  role the fan-out assumes (default OrganizationAccountAccessRole)
+#   ROLE_NAME_PREFIX     IAM roles <prefix>-plan and -apply (default github-<repo>)
+#
+# Not stored: STATE_BUCKET (default: bootstrap/state-bucket output, stored as a
+# secret), TFVARS_FILE (default accounts/terraform.tfvars), COMMIT_MESSAGE.
 #
 # With no steps, runs all of them in this order:
 #
 #   preflight    check tools, logins and that AWS is the management account
 #   repo         create the repository (if missing) and set merge options
-#   teams        GH_TEAM = all current org members (Write);
-#                GH_APPROVER_TEAM = only GH_APPROVER (Write, ruleset bypass)
+#   teams        GH_TEAM = org members except owners (Write);
+#                GH_APPROVER_TEAM = only the approvers (Write, ruleset bypass)
 #   actions      read-only GITHUB_TOKEN; approval for all fork PR workflows
 #   code         write .github/CODEOWNERS; first push to an empty repo
 #   aws          GitHub OIDC provider + plan/apply IAM roles in this account
-#   environment  APPLY_ENVIRONMENT: GH_APPROVER must approve; main only
+#   environment  APPLY_ENVIRONMENT: an approver must approve; main only
+#   variables    the settings above as Actions variables
 #   secrets      role ARNs, state bucket and tfvars (base64) as Actions secrets
 #   rulesets     main: PR + passing "plan" check for everyone; code-owner
-#                (GH_APPROVER) review, bypassable via PR by GH_APPROVER_TEAM
+#                (an approver) review, bypassable via PR by GH_APPROVER_TEAM
 #
 # Requirements: gh (logged in with scopes repo, workflow, admin:org; an org
-# owner, or a member allowed to create repositories and teams), aws (management-account credentials), jq, git, terraform (only to
-# read the state bucket name when STATE_BUCKET is unset).
+# owner, or a member allowed to create repositories and teams), aws
+# (management-account credentials), jq, git, terraform (only to read the state
+# bucket name when STATE_BUCKET is unset).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-CONFIG="${1:?usage: $0 <config.env> [step ...]}"
-shift
-# shellcheck source=/dev/null
-source "$CONFIG"
+say() { printf '\n== %s\n' "$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-: "${GH_ORG:?}" "${GH_REPO:?}" "${GH_APPROVER:?}" "${GH_TEAM:?}" "${GH_APPROVER_TEAM:?}"
-: "${GH_VISIBILITY:=public}" "${APPLY_ENVIRONMENT:=production}"
-: "${AWS_REGION:=us-east-1}" "${STATE_KEY:=permissions/terraform.tfstate}"
+# Optional local settings file (git-ignored), KEY=value lines. Values already
+# set in the environment take priority.
+SETTINGS_FILE="${SETTINGS_FILE:-$(dirname "${BASH_SOURCE[0]}")/settings.env}"
+if [ -f "$SETTINGS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]%%#*}"                       # drop trailing comment
+    value="${value%"${value##*[![:space:]]}"}"           # trim trailing spaces
+    value="${value#\"}"; value="${value%\"}"             # drop surrounding quotes
+    [ -z "${!key:-}" ] && printf -v "$key" '%s' "$value"
+  done < "$SETTINGS_FILE"
+fi
+
+: "${GH_ORG:?set GH_ORG (GitHub organization)}" "${GH_REPO:?set GH_REPO (repository name)}"
+REPO="${GH_ORG}/${GH_REPO}"
+
+# Settings stored as repository Actions variables by the `variables` step.
+SETTINGS=(GH_APPROVER GH_VISIBILITY GH_TEAM GH_APPROVER_TEAM APPLY_ENVIRONMENT
+          AWS_REGION STATE_KEY EXECUTION_ROLE_NAME ROLE_NAME_PREFIX)
+
+# Fill unset settings from the repository's variables, if it exists.
+if gh repo view "$REPO" >/dev/null 2>&1; then
+  stored="$(gh variable list --repo "$REPO" --json name,value 2>/dev/null || echo '[]')"
+  for name in "${SETTINGS[@]}"; do
+    if [ -z "${!name:-}" ]; then
+      value="$(jq -r --arg n "$name" '.[] | select(.name == $n) | .value' <<< "$stored")"
+      [ -n "$value" ] && printf -v "$name" '%s' "$value"
+    fi
+  done
+fi
+
+: "${GH_APPROVER:?set GH_APPROVER (not stored on the repository yet)}"
+: "${GH_VISIBILITY:=public}" "${GH_TEAM:=$GH_REPO}" "${GH_APPROVER_TEAM:=${GH_REPO}-approvers}"
+: "${APPLY_ENVIRONMENT:=production}" "${AWS_REGION:=us-east-1}"
+: "${STATE_KEY:=permissions/terraform.tfstate}"
 : "${EXECUTION_ROLE_NAME:=OrganizationAccountAccessRole}"
 : "${ROLE_NAME_PREFIX:=github-${GH_REPO}}" "${TFVARS_FILE:=accounts/terraform.tfvars}"
 : "${COMMIT_MESSAGE:=Initial import}"
 
+IFS=',' read -ra APPROVERS <<< "${GH_APPROVER// /}"
+[ "${#APPROVERS[@]}" -ge 1 ] || die "GH_APPROVER lists no users"
+[ "${#APPROVERS[@]}" -le 6 ] || die "GH_APPROVER: an environment allows at most 6 reviewers"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REPO="${GH_ORG}/${GH_REPO}"
 OIDC_HOST="token.actions.githubusercontent.com"
 export AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
 
-say() { printf '\n== %s\n' "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Team slugs are derived from names; keep names slug-shaped so they match.
 for t in "$GH_TEAM" "$GH_APPROVER_TEAM"; do
@@ -76,8 +132,9 @@ step_preflight() {
   if [ "$(gh api "user/memberships/orgs/$GH_ORG" --jq .role)" != admin ]; then
     echo "note: $(gh api user --jq .login) is a member, not an owner, of $GH_ORG"
   fi
-  gh api "orgs/$GH_ORG/members/$GH_APPROVER" >/dev/null 2>&1 \
-    || die "$GH_APPROVER is not a member of $GH_ORG"
+  for t in "${APPROVERS[@]}"; do
+    gh api "orgs/$GH_ORG/members/$t" >/dev/null 2>&1 || die "approver $t is not a member of $GH_ORG"
+  done
 
   local caller mgmt
   caller="$(aws sts get-caller-identity --query Account --output text)"
@@ -134,16 +191,19 @@ step_teams() {
   # Creating a team adds the creator as a maintainer; this team must hold only
   # the approver, because it may bypass the review ruleset.
   ensure_team "$GH_APPROVER_TEAM" "May merge their own PRs on $GH_REPO (via PR only)"
-  if ! gh api "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$GH_APPROVER" >/dev/null 2>&1; then
-    gh api -X PUT "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$GH_APPROVER" -f role=maintainer >/dev/null
-  fi
+  for t in "${APPROVERS[@]}"; do
+    if ! gh api "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$t" >/dev/null 2>&1; then
+      gh api -X PUT "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$t" -f role=maintainer >/dev/null
+      echo "added $t to $GH_APPROVER_TEAM"
+    fi
+  done
   while IFS= read -r user; do
-    if [ "$user" != "$GH_APPROVER" ]; then
+    if [[ ",${GH_APPROVER// /}," != *",$user,"* ]]; then
       gh api -X DELETE "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$user" >/dev/null
       echo "removed $user from $GH_APPROVER_TEAM"
     fi
   done < <(gh api --paginate "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/members" --jq '.[].login')
-  echo "ok: $GH_APPROVER_TEAM = $GH_APPROVER"
+  echo "ok: $GH_APPROVER_TEAM = ${APPROVERS[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -164,8 +224,10 @@ step_actions() {
 step_code() {
   say "code"
   mkdir -p "$ROOT/.github"
-  printf '# Every change needs review by the approver (enforced by a ruleset).\n* @%s\n' "$GH_APPROVER" \
-    > "$ROOT/.github/CODEOWNERS"
+  {
+    echo "# Every change needs review by one of the approvers (enforced by a ruleset)."
+    printf '*'; printf ' @%s' "${APPROVERS[@]}"; echo
+  } > "$ROOT/.github/CODEOWNERS"
 
   if gh api "repos/$REPO/branches/main" >/dev/null 2>&1; then
     echo "ok: main exists; CODEOWNERS written locally - change it through a PR if it differs"
@@ -295,14 +357,14 @@ step_aws() {
 # ---------------------------------------------------------------------------
 step_environment() {
   say "environment $APPLY_ENVIRONMENT"
-  local approver_id
-  approver_id="$(gh api "users/$GH_APPROVER" --jq .id)"
-  # Admins can't skip the approval; the approver may approve runs they started.
-  jq -n --argjson id "$approver_id" '{
+  local reviewers t
+  reviewers="$(for t in "${APPROVERS[@]}"; do gh api "users/$t" --jq '{type: "User", id: .id}'; done | jq -s .)"
+  # Admins can't skip the approval; an approver may approve runs they started.
+  jq -n --argjson reviewers "$reviewers" '{
     wait_timer: 0,
     prevent_self_review: false,
     can_admins_bypass: false,
-    reviewers: [{ type: "User", id: $id }],
+    reviewers: $reviewers,
     deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }
   }' | gh api -X PUT "repos/$REPO/environments/$APPLY_ENVIRONMENT" --input - >/dev/null
 
@@ -311,7 +373,17 @@ step_environment() {
     gh api -X POST "repos/$REPO/environments/$APPLY_ENVIRONMENT/deployment-branch-policies" \
       -f name=main -f type=branch >/dev/null
   fi
-  echo "ok: reviewer $GH_APPROVER, branch main only"
+  echo "ok: reviewers ${APPROVERS[*]}, branch main only"
+}
+
+# ---------------------------------------------------------------------------
+step_variables() {
+  say "variables"
+  local name
+  for name in "${SETTINGS[@]}"; do
+    gh variable set "$name" --repo "$REPO" --body "${!name}"
+  done
+  echo "ok: ${SETTINGS[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -329,7 +401,6 @@ step_secrets() {
   base64 < "$ROOT/$TFVARS_FILE" | tr -d '\n' | gh secret set TFVARS_BASE64 --repo "$REPO"
   gh secret set AWS_APPLY_ROLE_ARN --repo "$REPO" --env "$APPLY_ENVIRONMENT" \
     --body "arn:aws:iam::${account}:role/${ROLE_NAME_PREFIX}-apply"
-  gh variable set AWS_REGION --repo "$REPO" --body "$AWS_REGION"
   echo "ok"
 }
 
@@ -392,7 +463,7 @@ step_rulesets() {
 }
 
 # ---------------------------------------------------------------------------
-ALL_STEPS=(preflight repo teams actions code aws environment secrets rulesets)
+ALL_STEPS=(preflight repo teams actions code aws environment variables secrets rulesets)
 STEPS=("$@")
 [ "${#STEPS[@]}" -gt 0 ] || STEPS=("${ALL_STEPS[@]}")
 for s in "${STEPS[@]}"; do
