@@ -1,90 +1,282 @@
-# AWS identity: delegated IAM for Identity Center permission sets
+# AWS access management
 
-Terraform that lets users of IAM Identity Center permission sets (for example
-`PowerUserAccess`) create their own IAM roles, safely, in **every account under
-an OU** (or the whole organization). You define any number of
-[delegations](#delegations), each with:
+This repository controls how people in our AWS Organization can create and use
+IAM roles. It lets users of IAM Identity Center permission sets (for example
+`PowerUserAccess`) create the IAM roles their workloads need, such as EC2
+instance roles, ECS task roles and CI roles, without being able to give
+those roles, or themselves, more access than the platform team allows.
 
-- a **role boundary** that caps every role its users create,
-- a **delegation policy** on its permission sets that lets users create and pass
-  roles only under the delegation's naming prefix and only with its boundary attached,
-- optionally a **permission-set boundary** that caps the users' own sessions.
+It does this in every account under one OU (or the whole organization):
 
-Shared by all delegations:
+- **Delegations.** Each delegation gives one or more permission sets the right
+  to create IAM roles, policies and instance profiles under a naming prefix
+  (for example `app-`), but only with a **role boundary** attached. The
+  boundary caps what those roles can ever do. A delegation can also cap the
+  permission set's own sessions with a **permission-set boundary**.
+- **Platform roles.** Roles that need more than any boundary allows (by default
+  the EKS cluster and node roles) are created centrally. Users can pass them to
+  the services that need them, but can't change them.
+- **GitHub Actions OIDC provider** in every account, so teams can give their
+  workflows AWS access without long-lived keys.
+- **Guardrails** (resource control policies on the OU): only approved GitHub
+  organizations can use the GitHub OIDC provider, and roles can't be assumed
+  from AWS accounts outside the organization.
 
-- **platform roles** (by default the EKS cluster and node roles) users can pass but not change,
-- the **GitHub Actions OIDC provider**, guarded by a **resource control policy**
-  that only lets your GitHub org(s) use it.
+Changes are made by pull request. A GitHub Actions workflow plans every pull
+request and, after merge and the approver's sign-off, applies the change.
 
-End-user instructions are in the [Developer guide](#developer-guide) at the end.
+**Who should read what:**
+
+| You are | Read |
+|---|---|
+| Setting this up in a new organization | [One-time setup](#one-time-setup) |
+| Changing policies, delegations or accounts | [Day-to-day operations](#day-to-day-operations) |
+| Looking up what a component or setting does | [Components and configuration](#components-and-configuration) |
+| A developer creating roles for your workloads | [Developer guide](#developer-guide) |
 
 ## Repository layout
 
-| Directory | What it is | Applied |
+| Path | What it is | How it's applied |
 |---|---|---|
-| [`accounts/`](accounts/) | Delegation policies and boundaries, platform roles, GitHub OIDC provider, RCPs, fanned out to every account under the OU. **Start here.** | GitHub Actions (or locally) |
-| [`bootstrap/state-bucket/`](bootstrap/state-bucket/main.tf) | S3 bucket for Terraform state, usable only by IAM roles inside the org. | Once, by hand (local state) |
-| [`bootstrap/github/`](bootstrap/github/setup.sh) | Script that sets up the GitHub repository (teams, rulesets, environment, secrets) and the GitHub OIDC plan/apply roles in the management account. Reusable for other organizations. | By hand; idempotent, re-run to repair |
-| [`.github/`](.github/workflows/terraform.yml) | Workflow: plan on pull request, approved apply on merge to `main`. | — |
-| [`examples/`](examples/) | Trust and permissions policy templates for end users (see the [Developer guide](#developer-guide)), and an example `AdministratorAccess` delegation in `examples/delegations/admin/`. Not used by Terraform. | — |
-
-`bootstrap/state-bucket/` is a separate Terraform configuration, applied once by
-hand with its own local state. Apply it before running `bootstrap/github/setup.sh`,
-which reads the bucket name from it.
+| [`accounts/`](accounts/) | The main Terraform configuration: delegations, platform roles, GitHub OIDC provider and guardrails, fanned out to every account under the OU. | GitHub Actions on merge (or locally) |
+| [`bootstrap/state-bucket/`](bootstrap/state-bucket/main.tf) | S3 bucket for the `accounts/` Terraform state. | Once, by hand (local state) |
+| [`bootstrap/github/`](bootstrap/github/setup.sh) | Script that sets up the GitHub repository and the AWS roles the workflow uses. Reusable for other organizations. | Once, by hand; re-run to repair or sync |
+| [`.github/`](.github/workflows/terraform.yml) | The plan/apply workflow and its helpers. | — |
+| [`examples/`](examples/) | Policy templates for developers, and an example `AdministratorAccess` delegation. Not used by Terraform. | — |
 
 All commands below run from the repository root unless they `cd` somewhere.
 
-## Quickstart
+---
+
+## One-time setup
+
+Do these steps once per organization, in order.
 
 ### Prerequisites
 
-- An AWS Organization with IAM Identity Center, and the existing permission sets
-  your delegations name (for example `PowerUserAccess`) assigned to the accounts
-  under the OU.
-- `OrganizationAccountAccessRole` (or the role you set in `execution_role_name`)
-  in every account under the OU. Organizations creates it only in accounts it
-  created; add it by hand to invited accounts.
-- Management-account credentials (or Organizations / Identity Center delegated
-  admin plus a path to the execution role in each account). They must be an
-  **IAM role session** (for example an Identity Center login), not an IAM user or
-  the root user: the state bucket policy only allows roles inside the org.
-- Terraform ≥ 1.10 (CI pins 1.10.5), `bash`, AWS CLI v2 and `jq`. The fan-out
-  scripts shell out to the CLI and parse their manifests with `jq` (both are
-  preinstalled on GitHub's `ubuntu-latest` runners).
+- An AWS Organization with IAM Identity Center, and the permission sets your
+  delegations will extend (for example `PowerUserAccess`).
+- `OrganizationAccountAccessRole` (or another role, set as `execution_role_name`)
+  in every account under the OU, assumable from the management account.
+  Organizations creates it only in accounts it created; add it by hand to
+  invited accounts.
+- Management-account AWS credentials.
+- A GitHub organization, and a `gh` login that can create repositories and
+  teams there (an org owner, or a member if the org allows members to).
+- Terraform ≥ 1.10, `bash`, AWS CLI v2, `jq`, `git` and the GitHub CLI `gh`.
 
-### 1. One-time AWS setup
+### 1. Create the state bucket
 
 ```bash
-# State bucket. Apply with credentials for the account that should hold the
-# state (e.g. an automation account, not the management account).
 cd bootstrap/state-bucket
 cp terraform.tfvars.example terraform.tfvars    # bucket_name, org_id
 terraform init && terraform apply
 cd ../..
+```
 
-# Enable resource control policies on the org root (management account).
+Use credentials for the account that should hold the state. The bucket only
+accepts IAM roles inside the organization. This configuration keeps its own
+state in a local, git-ignored `terraform.tfstate`; keep that file somewhere safe.
+
+### 2. Enable resource control policies
+
+In the management account:
+
+```bash
 aws organizations enable-policy-type \
   --root-id "$(aws organizations list-roots --query 'Roots[0].Id' --output text)" \
   --policy-type RESOURCE_CONTROL_POLICY
 ```
 
-`bootstrap/state-bucket/` keeps its state in a local `terraform.tfstate`, which is
-git-ignored. Keep it somewhere safe.
-
-### 2. Configure
+### 3. Configure `accounts/`
 
 ```bash
 cd accounts
 cp backend.hcl.example backend.hcl                # state bucket + region
-cp terraform.tfvars.example terraform.tfvars      # ou_id, delegations, github_orgs
+cp terraform.tfvars.example terraform.tfvars      # ou_id, delegations, github_orgs, ...
+cd ..
 ```
 
-`delegations` and `github_orgs` are required. Every other value has a default in
-[`variables.tf`](accounts/variables.tf). If you leave `ou_id` unset, the whole
-organization is covered (the root id is looked up). Only `ACTIVE` accounts are
-targeted, including those in nested OUs. Both files are git-ignored.
+`delegations` and `github_orgs` are required; see
+[Inputs](#inputs-accountsvariablestf) for the rest. Both files are git-ignored.
 
-### 3a. Apply locally
+Before the first apply, list in `trusted_external_account_ids` every AWS
+account **outside** the organization that assumes roles in your accounts (for
+example monitoring or security vendors). The
+[`sts-assumerole-org-only`](#guardrails) guardrail blocks all others.
+
+### 4. Set up the GitHub repository and CI access
+
+[`bootstrap/github/setup.sh`](bootstrap/github/setup.sh) holds every `gh` and
+AWS CLI command needed. It is idempotent. Copy its settings file for your
+organization:
+
+```bash
+cp bootstrap/github/project-tech4dev.env bootstrap/github/<your-org>.env   # edit the values
+gh auth login -h github.com -s admin:org,workflow
+bootstrap/github/setup.sh bootstrap/github/<your-org>.env
+```
+
+It creates the repository, teams, Actions settings, `CODEOWNERS`, the AWS
+OIDC provider and plan/apply roles, the `production` environment, the secrets
+and the branch rulesets, and makes the first push to `main`. See
+[GitHub repository and workflow](#github-repository-and-workflow) for what each
+piece does.
+
+If you're not an org owner, the script warns where an owner has to step in.
+For example, adding members to the team after you've stopped being its
+maintainer.
+
+### 5. First apply
+
+The first push to `main` starts the workflow. Review the plan summary of the
+`plan-main` job, then approve the `production` environment to apply. (Or apply
+locally: see [Running Terraform locally](#running-terraform-locally).)
+
+Then:
+
+1. **Assign the permission sets** to the accounts in Identity Center, if they
+   aren't already. Assign them only after the apply: provisioning fails in an
+   account where the delegation policy doesn't exist yet.
+2. **Test the GitHub guardrail.** A workflow in a repository outside
+   `github_orgs` must get `AccessDenied` from `AssumeRoleWithWebIdentity` in a
+   member account. If it doesn't, the RCP isn't matching. Fix that before
+   relying on it.
+
+---
+
+## Day-to-day operations
+
+### Making a change
+
+Every change goes through a pull request to `main`:
+
+1. Create a branch **in this repository**, not a fork. Fork PRs get no AWS
+   credentials, so their `plan` check fails.
+2. Open a pull request. The `plan` job runs `terraform fmt -check`, `validate`
+   and `plan`. It must pass.
+3. The approver reviews and approves the pull request, then it is merged.
+4. On `main`, the `plan-main` job plans again. If anything changes, the
+   `apply` job waits for the approver to approve the `production` environment.
+5. After approval, `apply` plans once more and stops if the list of changed
+   resources differs from what was approved, then applies.
+
+| Who | Can |
+|---|---|
+| Org members (team `aws-access-management`) | Push branches and open pull requests. |
+| Org owners | Everything a repository admin can, including changing rulesets and the environment. |
+| The approver (`GH_APPROVER`) | Approve pull requests (as code owner); approve applies; merge their own pull requests without an approval, but only through a pull request. |
+| Anyone | Push to `main` directly: nobody can. Skip the `plan` check: nobody can. |
+
+**The plan is not shown in the logs.** The repository is public, and so are its
+Actions logs. The jobs show only which resources change and how (for example
+`create terraform_data.platform_roles["platform-eks-node"]`). Account,
+organization, OU and Identity Center IDs are masked. To review the full diff,
+check out the branch and run `terraform plan` locally.
+
+The apply's safety check compares the list of resources and actions, not their
+contents. If `main` moves between approval and apply, re-run the workflow and
+review again.
+
+### Changing a delegation's policies
+
+Edit a template under `accounts/policies/delegations/<key>/`, or that
+delegation's entry in `terraform.tfvars`, and open a pull request. When applied,
+only that delegation's `terraform_data.delegated_iam_policies["<key>"]` is
+replaced:
+
+1. `destroy-policies.sh` runs first. It leaves every policy that is still
+   attached (the delegation policy on Identity Center roles, the boundary on
+   roles that use it). In an account where a policy isn't attached to anything,
+   it is deleted and recreated seconds later with the same ARN.
+2. `apply-policies.sh` adds a new default version of each policy in every
+   account. When a policy already has five versions, the oldest non-default one
+   is deleted first.
+
+Permission sets reference the delegation policy by name, so the new version
+takes effect without re-provisioning.
+
+### Changing `terraform.tfvars`
+
+The workflow reads `accounts/terraform.tfvars` from the `TFVARS_BASE64` secret,
+not from the repository. After changing the file locally, update the secret
+and then open a pull request (any change under `accounts/` will do, or run the
+workflow on `main` by hand):
+
+```bash
+bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env secrets
+```
+
+### Adding or removing a delegation
+
+- **Add:** create `accounts/policies/delegations/<key>/` with
+  `delegation.json.tftpl` and `role-boundary.json.tftpl` (and optionally
+  `permission-set-boundary.json.tftpl`), add the entry to `delegations` in
+  `terraform.tfvars`, update the secret, open a pull request. See
+  [Delegations](#delegations) for the templates and rules.
+- **Remove:** remove the entry. The apply deletes its policies in every
+  account, except those still attached (see [Teardown](#teardown)).
+
+### Adding an account
+
+1. Create or move the account under the OU. Make sure it has the execution role.
+2. Run the workflow on `main` (**Actions → terraform (accounts) → Run
+   workflow**), then approve the apply. A new account changes no file, so a
+   merge alone doesn't pick it up.
+3. Assign the permission sets to the account afterwards. If you assigned them
+   first, [re-provision](#re-provisioning-a-permission-set) after the apply.
+
+The apply re-runs every fan-out script in every account, because the account
+list is a trigger. This is safe; the scripts are idempotent.
+
+### Adding new org members to the team
+
+```bash
+bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env teams
+```
+
+This needs a `gh` user who is an org owner or the team's maintainer. Org owners
+don't need the team; they already have admin access.
+
+### Changing a fan-out script
+
+The scripts in `accounts/scripts/` are not triggers: editing one changes nothing
+until its resource is replaced. Replace it locally (`-replace` isn't available
+in CI), or make the change in the same pull request as an edit that changes a
+trigger:
+
+| Script | Re-run with |
+|---|---|
+| `apply-policies.sh` | `terraform apply -replace='terraform_data.delegated_iam_policies["<key>"]'` |
+| `apply-platform-roles.sh` | `terraform apply -replace='terraform_data.platform_roles["<role>"]'` |
+| `apply-github-oidc.sh` | `terraform apply -replace=terraform_data.github_oidc` |
+| `lib.sh` | Each resource whose script needs the change. |
+
+`destroy-policies.sh` needs no re-run: Terraform runs the copy on disk the next
+time its resource is replaced or destroyed.
+
+### Repairing drift
+
+The objects the fan-out scripts create aren't in Terraform state, so Terraform
+can't see if someone changes or deletes them. To repair them, replace the
+resource as in the table above.
+
+### Re-provisioning a permission set
+
+Terraform provisions permission sets after attaching policies. If a change
+doesn't reach an account (for example, provisioning failed because the policy
+didn't exist there yet), provision once:
+
+```bash
+aws sso-admin provision-permission-set \
+  --instance-arn <arn> --permission-set-arn <arn> \
+  --target-type ALL_PROVISIONED_ACCOUNTS
+```
+
+### Running Terraform locally
+
+Use an IAM **role** session in the management account, such as an Identity
+Center admin login. The state bucket rejects IAM users.
 
 ```bash
 cd accounts
@@ -93,109 +285,71 @@ terraform plan
 terraform apply
 ```
 
-State is stored at `permissions/terraform.tfstate` in the bucket, with native S3
-locking (no DynamoDB table). After the first apply,
-[test the GitHub guardrail](#github-actions-oidc).
+### Teardown
 
-### 3b. Apply from GitHub Actions
+Run locally: `terraform destroy`. It detaches the delegation policies and any
+permission-set boundaries from the permission sets, deletes the RCPs, then
+deletes each delegation's policies in every account, delegation policy first.
+A policy still attached somewhere is left in place with a warning: remove the
+reference, re-provision the permission set, then run again. A role boundary can
+only be deleted once no roles use it. Platform roles and the GitHub OIDC
+provider are never deleted automatically.
 
-[`.github/workflows/terraform.yml`](.github/workflows/terraform.yml):
+---
 
-- **Pull request** (from a branch of the repository; fork PRs fail, because
-  they get no AWS credentials): `terraform fmt -check`, `validate` and `plan`.
-  The `plan` check must pass before merging.
-- **Merge to `main`** (changes under `accounts/` or `.github/`, or a manual
-  *Run workflow* on `main`): `plan-main` plans again. If anything changes, the
-  `apply` job waits for the approver to approve the `production` environment,
-  re-plans, stops if the changes differ from the approved plan, and applies.
+## Components and configuration
 
-Who can do what:
-
-| | |
-|---|---|
-| Open PRs | Members of the `GH_TEAM` team (all org members), which has Write. |
-| Approve PRs | Only `GH_APPROVER`, as the code owner (`.github/CODEOWNERS`). A new push dismisses the approval. |
-| Merge own PRs without approval | Only `GH_APPROVER` (the `GH_APPROVER_TEAM` team may bypass the review ruleset, but only when merging a PR). |
-| Push to `main` directly | Nobody. |
-| Approve the apply | Only `GH_APPROVER`. Admins can't bypass it. |
-
-**Public logs.** In a public repository anyone can read the Actions logs. The
-workflow therefore takes every value from secrets (which GitHub masks), masks
-account, organization, OU and Identity Center IDs, and shows only which
-resources change and how, never the plan's contents. To review the full diff,
-run `terraform plan` locally (step 3a) on the PR branch.
-
-AWS access uses OIDC and two roles in the management account, created by the
-setup script: a plan role (read-only; pull requests and `main`) and an apply role
-(only jobs in the `production` environment; may assume the execution role only
-in accounts of this organization).
-
-**Set up** with an org owner's `gh` login and management-account AWS credentials:
-
-```bash
-gh auth login -h github.com -s admin:org,workflow
-bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env
-```
-
-For another organization, copy `project-tech4dev.env`, change the values and
-pass the copy. Steps can be run one at a time, for example
-`bootstrap/github/setup.sh <env> teams` to add new org members to the team. See
-the header of [`setup.sh`](bootstrap/github/setup.sh) for the steps.
-
-`TFVARS_BASE64` is the only copy of the deployment's values that CI sees. When
-you change `accounts/terraform.tfvars`, update it:
-
-```bash
-bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env secrets
-```
-
-## What it creates
+### `accounts/`: what it creates
 
 | Resource | What it does |
 |---|---|
-| `terraform_data.delegated_iam_policies["<delegation>"]` | Runs `scripts/apply-policies.sh`, which assumes `execution_role_name` in each account and upserts the delegation's policies, rendered from `policies/delegations/<delegation>/`. |
+| `terraform_data.delegated_iam_policies["<delegation>"]` | Runs `scripts/apply-policies.sh`: upserts the delegation's policies (role boundary, optional permission-set boundary, delegation policy) in every account. |
 | `aws_ssoadmin_customer_managed_policy_attachment.delegation["<delegation>/<permission set>"]` | Attaches the delegation policy to each of its permission sets, by name. |
-| `aws_ssoadmin_permissions_boundary_attachment.delegation["<delegation>/<permission set>"]` | Only for delegations with a `permission-set-boundary.json.tftpl`: sets that policy as the permission sets' permissions boundary. |
-| `terraform_data.platform_roles["<role>"]` | Runs `scripts/apply-platform-roles.sh`: creates the platform role in each account. |
-| `terraform_data.github_oidc` | Runs `scripts/apply-github-oidc.sh`: creates the GitHub Actions OIDC provider in each account. |
-| `aws_organizations_policy.github_oidc` + attachment | Resource control policy `github-oidc-trusted-orgs` on the OU: only `github_orgs` can use the GitHub OIDC provider. |
-| `aws_organizations_policy.sts_org_only` + attachment | Resource control policy `sts-assumerole-org-only` on the OU: `sts:AssumeRole` only from principals in the org, AWS services, or `trusted_external_account_ids`. **List vendor accounts that assume roles here before the first apply**, or their integrations break. |
+| `aws_ssoadmin_permissions_boundary_attachment.delegation["<delegation>/<permission set>"]` | Only for delegations with `permission-set-boundary.json.tftpl`: sets it as the permission sets' boundary. |
+| `terraform_data.platform_roles["<role>"]` | Runs `scripts/apply-platform-roles.sh`: upserts the platform role in every account. |
+| `terraform_data.github_oidc` | Runs `scripts/apply-github-oidc.sh`: creates the GitHub Actions OIDC provider in every account. |
+| `aws_organizations_policy.github_oidc` + attachment | RCP `github-oidc-trusted-orgs` on the OU (see [Guardrails](#guardrails)). |
+| `aws_organizations_policy.sts_org_only` + attachment | RCP `sts-assumerole-org-only` on the OU (see [Guardrails](#guardrails)). |
 
 Outputs: `target_account_ids`, `target_account_count`, `permission_set_arns`,
 `delegation_policies`.
 
-The role boundary is never attached to the permission set. It is the ceiling
-users put on the roles *they* create. To cap the users' own sessions, add a
-separate `permission-set-boundary.json.tftpl` (see [Delegations](#delegations)).
+### Inputs (`accounts/variables.tf`)
 
-### `terraform_data` and the fan-out scripts
+| Input | Default | Purpose |
+|---|---|---|
+| `delegations` | required | See [Delegations](#delegations). |
+| `github_orgs` | required | GitHub organizations allowed to use the GitHub OIDC provider. Case-sensitive. |
+| `ou_id` | whole org | OU (or root) whose `ACTIVE` accounts, including nested OUs, are covered. |
+| `execution_role_name` | `OrganizationAccountAccessRole` | Role the fan-out scripts assume in each account. |
+| `platform_roles` | the two EKS roles | See [Platform roles](#platform-roles). |
+| `trusted_external_account_ids` | none | Accounts outside the org that may still assume roles here. |
+| `region` | `us-east-1` | Identity Center region; region for STS and CLI calls. |
+| `org_role_arn`, `idcaccount_role_arn` | none | Roles to assume for Organizations and Identity Center calls when Terraform doesn't run in the management account. |
 
-`terraform_data` creates nothing in AWS. It stores its trigger values in state
-and runs its `local-exec` script when created or replaced. The objects the
-scripts create (policies, roles, OIDC provider) are **not** in Terraform state,
-so:
+### How the fan-out works
 
-- A script re-runs only when one of its `triggers_replace` values changes (the
-  account list, the execution role, or the hash of the *rendered* policies or
-  platform role). Editing a script does **not** re-run it. See
-  [Changing a script](#changing-a-script).
-- There is no drift detection. To repair a changed or deleted object, force a
-  re-run: `terraform apply -replace=terraform_data.<name>`. The scripts are idempotent.
-- New accounts in the OU are picked up on the **next apply**.
-- If any account fails (the execution role can't be assumed, or any AWS call
-  fails), the script still processes the others, then exits non-zero and the
-  apply fails. Fix the cause and apply again.
+Terraform can't create one native resource per account discovered at plan time:
+a provider block can't use `for_each`, and an `aws_iam_policy` needs a provider
+pinned to one account. So `terraform_data` resources run scripts that assume
+`execution_role_name` in each account and create the objects with the AWS CLI.
+(The alternative, a CloudFormation StackSet, would add a second toolchain.)
 
-**Why scripts instead of native resources:** a provider block can't use
-`for_each`, and each `aws_iam_policy` needs a provider pinned to one account. So
-Terraform can't create one resource per discovered account in a single apply.
-The alternative is a service-managed CloudFormation StackSet on the OU, which
-adds a second toolchain.
+- `terraform_data` creates nothing in AWS. It stores its triggers in state and
+  runs its script when created or replaced.
+- Triggers are the account list, the execution role, and a hash of the
+  *rendered* policies or platform role. A new account, a template change or a
+  tfvars change re-runs the script; editing the script itself does not.
+- Templates are rendered by Terraform; the only per-account value is the
+  account ID, which the scripts substitute for the token `__ACCOUNT_ID__`.
+- If any account fails, the script still processes the others, then exits
+  non-zero and the apply fails. Fix the cause and apply again.
+- Scripts need `aws` and `jq` (preinstalled on GitHub's `ubuntu-latest` runners).
 
-## Delegations
+### Delegations
 
-A delegation is one prefix plus one role boundary, granted to one or more
-permission sets. Its key names the template directory:
+A delegation is one naming prefix plus one role boundary, granted to one or
+more permission sets. Its key names its template directory:
 
 ```
 accounts/policies/delegations/<key>/
@@ -211,239 +365,228 @@ delegations = {
     prefix                 = "app"
     role_boundary_name     = "PowerUserRoleBoundary"
     delegation_policy_name = "poweruser-iam-delegation" # default "iam-delegation-<key>"
-    pass_to_services       = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com", "pods.eks.amazonaws.com"]
+    pass_to_services       = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com", "pods.eks.amazonaws.com",
+                              "events.amazonaws.com", "scheduler.amazonaws.com"]
     platform_roles         = { platform-eks-cluster = ["eks.amazonaws.com"], platform-eks-node = ["eks.amazonaws.com"] }
   }
 }
 ```
 
-To give a permission set more than one prefix and boundary, list it in more
-than one delegation. Each prefix always maps to exactly one boundary. A
-permission set can have only one permission-set boundary, so at most one of its
-delegations may have `permission-set-boundary.json.tftpl`.
+- `pass_to_services`: services users may pass their prefixed roles to.
+- `platform_roles`: platform roles users may pass, and to which services.
+- `permission_set_boundary_name`: default `permission-set-boundary-<key>`; used
+  only if that template exists.
 
-**Templates** are rendered with Terraform's `templatefile()` and checked as JSON
-at plan time. They can use these variables:
+To give a permission set more than one prefix and boundary, list it in more
+than one delegation. A permission set can have only one permission-set
+boundary, so at most one of its delegations may have that template.
+
+The role boundary is never attached to the permission set: it caps the roles
+users *create*. Attaching it to the permission set would cancel the IAM
+permissions the delegation policy grants.
+
+**Templates** are rendered with Terraform's `templatefile()` and must be valid
+JSON at plan time. Variables available to every template:
 
 | Variable | Value |
 |---|---|
 | `account_id` | The token `__ACCOUNT_ID__`, replaced by the scripts in each account. |
 | `prefix`, `role_boundary_name` | This delegation's values. |
-| `pass_to_services` | Services prefixed roles may be passed to. |
-| `platform_roles` | Platform role name ⇒ services, for this delegation. |
-| `all_platform_roles`, `all_prefixes` | Across every delegation / platform role. |
+| `pass_to_services`, `platform_roles` | This delegation's values. |
+| `all_platform_roles`, `all_prefixes` | Across all platform roles / delegations. |
 | `managed_policy_names` | Every policy this configuration creates. Protect them all, not just your own. |
 | `execution_role_name` | The fan-out role, for templates that protect it. |
 
-A template that needs loops or optional statements is easiest to write as
-`${jsonencode({ ... })}`, as `poweruser/delegation.json.tftpl` does. A static
-one can be plain JSON with `${account_id}` and `${prefix}`, as
-`poweruser/role-boundary.json.tftpl` is.
+A template with loops or optional statements is easiest to write as
+`${jsonencode({ ... })}`, like `poweruser/delegation.json.tftpl`. A static one
+can be plain JSON with `${account_id}` and `${prefix}`, like
+`poweruser/role-boundary.json.tftpl`.
 
-**Allow or Deny.** The `poweruser` delegation is made of Allow statements, because
-`PowerUserAccess` has no IAM permissions of its own. A permission set like
-`AdministratorAccess` already allows `iam:*`, so Allows add nothing and its
-delegation must be made of Denies. See `examples/delegations/admin/`, and copy it
-to `accounts/policies/delegations/admin/` to use it. An admin inside an account
-can usually find a way around Denies in identity policies, so use SCPs for
-limits admins must not bypass.
+**Allow or Deny.** The `poweruser` delegation is made of Allow statements,
+because `PowerUserAccess` has no IAM permissions of its own. A permission set
+like `AdministratorAccess` already allows `iam:*`, so Allows add nothing; its
+delegation must be made of Denies. See
+[`examples/delegations/admin/`](examples/delegations/admin/) and copy it to
+`accounts/policies/delegations/admin/` to use it. An admin inside an account
+can usually get around Denies in identity policies, so use SCPs for limits
+admins must not bypass.
 
 **Validation** rejects configurations where one delegation could reach into
 another's resources:
 
-- a prefix that equals or starts another (`app` and `app-data`: `app-*` matches `app-data-*`),
-- a managed policy name, platform role name or `execution_role_name` that starts with any `<prefix>-`,
-- duplicate policy names across delegations,
-- a delegation `platform_roles` entry that isn't in `var.platform_roles`,
-- a rendered policy over the 6,144-character managed policy limit.
+- a prefix that equals or starts another (`app` and `app-data`: `app-*` matches `app-data-*`);
+- a managed policy name, platform role name or `execution_role_name` that starts with any `<prefix>-`;
+- duplicate policy names across delegations;
+- a `platform_roles` entry that isn't in `var.platform_roles`;
+- malformed keys or prefixes, or a delegation with no permission sets;
+- a rendered policy over the 6,144-character managed policy limit (checked at plan).
 
-Removing a delegation from the map runs its teardown: its policies are deleted
-in every account, except any still attached (see [Teardown](#teardown)).
+### The `poweruser` delegation
 
-## Files
-
-Paths are relative to `accounts/` unless shown otherwise.
-
-| File | Purpose |
-|------|---------|
-| `versions.tf` | Terraform ≥ 1.10, AWS provider ≥ 6.0, partial S3 backend (bucket/region from `backend.hcl`). |
-| `providers.tf` | Default provider + optional `aws.org` / `aws.idcaccount` assume-role aliases (`org_role_arn`, `idcaccount_role_arn`). |
-| `variables.tf` | Inputs, including `delegations` and `platform_roles` and their validations. |
-| `delegations.tf` | Renders the delegation templates and platform roles into the manifests the scripts apply. |
-| `main.tf` | Data sources, fan-outs, permission-set attachments, RCPs, migration blocks. |
-| `outputs.tf` | Account list, account count, permission-set ARNs, policy names per delegation. |
-| `.terraform.lock.hcl` | Provider lock file. Commit it. |
-| `policies/delegations/<key>/*.json.tftpl` | Per-delegation templates (see [Delegations](#delegations)). |
-| `policies/platform-roles/*.json` | Trust policies for the platform roles. |
-| `scripts/lib.sh` | Shared account loop: assume the execution role, run a step, collect failures. |
-| `scripts/apply-policies.sh` / `destroy-policies.sh` | Upsert / best-effort delete of one delegation's policies per account. |
-| `scripts/apply-platform-roles.sh` | Upsert one platform role per account. Never deletes. |
-| `scripts/apply-github-oidc.sh` | Create the GitHub OIDC provider per account. Never deletes. |
-| `backend.hcl.example`, `terraform.tfvars.example` | Copy, fill in, keep out of git. |
-| `examples/*.json` | Trust policy and deploy policy templates for end users (see the Developer guide). |
-| `examples/delegations/admin/` | Example Deny-based delegation for `AdministratorAccess`. |
-| `bootstrap/state-bucket/main.tf` | State bucket (one-time). |
-| `bootstrap/github/setup.sh` + `*.env` | GitHub repository and CI AWS roles setup (idempotent). |
-| `.github/workflows/terraform.yml` | Plan on PR, approved apply on merge. |
-| `.github/actions/terraform-setup/` | Shared job setup: Terraform, AWS role, ID masking, tfvars, init. |
-| `.github/scripts/plan-summary.sh` | Plan without printing it; report only resource addresses and actions. |
-| `.github/CODEOWNERS` | Makes the approver the required reviewer. Written by the setup script. |
-
-## Rolling out a policy change
-
-Edit a template under `policies/delegations/<key>/` (or a value in that
-delegation's entry), then apply (or merge). The hash of the rendered policies is
-a trigger, so Terraform replaces only that delegation's
-`terraform_data.delegated_iam_policies["<key>"]`:
-
-1. `destroy-policies.sh` runs first. It skips any policy still attached to a role,
-   so in steady state nothing is removed.
-2. `apply-policies.sh` sets a new default policy version in every account. When
-   a policy already has five versions, the oldest non-default one is deleted first.
-
-The permission set references the delegation policy by name, so a new version
-takes effect without re-provisioning.
-
-Editing a platform role's trust policy or managed policies re-runs
-`apply-platform-roles.sh` for that role, which resets its trust policy and
-attaches any new managed policies. Nothing is deleted or detached.
-
-## Changing a script
-
-The scripts in `scripts/` are not triggers, so an edit to one changes nothing on
-the next apply. To roll it out, force a re-run of the resource that calls it:
-
-| Script | Re-run with |
+| | |
 |---|---|
-| `apply-platform-roles.sh` | `terraform apply -replace='terraform_data.platform_roles["<role>"]'` |
-| `apply-github-oidc.sh` | `terraform apply -replace=terraform_data.github_oidc` |
-| `apply-policies.sh` | `terraform apply -replace='terraform_data.delegated_iam_policies["<key>"]'` |
-| `lib.sh` | Re-run each resource whose script you need the change in. |
+| Permission set | `PowerUserAccess` |
+| Users can create | Roles, policies and instance profiles named `app-*`; roles only with `PowerUserRoleBoundary` |
+| Users can pass | `app-*` roles to EC2, ECS tasks, EKS Pod Identity, EventBridge and EventBridge Scheduler; the platform EKS roles to EKS |
+| Roles they create can use | S3, DynamoDB, SQS, SNS, CloudWatch, CloudWatch Logs, SSM (including Session Manager), ECS, ECR; `secretsmanager:GetSecretValue`, `kms:Decrypt`, `kms:GenerateDataKey`; `events:InvokeApiDestination` and `events:PutEvents` in the same account; passing `app-*` roles to ECS tasks |
+| Users can't | Remove a boundary, change the boundary or delegation policies, change roles outside `app-*`, create IAM users or OIDC providers |
 
-Replacing `delegated_iam_policies` runs `destroy-policies.sh` first, as in
-[Rolling out a policy change](#rolling-out-a-policy-change).
-`destroy-policies.sh` itself needs no re-run: Terraform runs the copy on disk
-the next time the resource is replaced or destroyed.
-
-In CI, `-replace` isn't available. Run it locally with the apply credentials, or
-make the change in the same pull request as an edit that changes a trigger.
-
-## Adding an account
-
-Move or create the account under the OU, then apply. The new account must have
-the execution role first (see [Prerequisites](#prerequisites)). Assign the
-permission set to the account **after** the apply: provisioning fails in an
-account where the delegation policies don't exist yet. If you assigned it first,
-[re-provision](#permission-set-provisioning) after the apply.
-
-The apply also re-runs the policy script in every existing account, because the
-account list is a trigger. This is safe; the scripts are idempotent.
-
-## Platform roles
+### Platform roles
 
 Some services can't run on a role under a role boundary. EKS cluster and node
 roles, for example, need EC2 networking, ELB and EKS API access that the
-`poweruser` boundary withholds. `terraform_data.platform_roles` creates each role
-in `var.platform_roles` in every account, **without** a boundary. The default is
-the two EKS roles:
+`poweruser` boundary withholds. Each role in `var.platform_roles` is created in
+every account **without** a boundary. The default:
 
-| Role (default name) | Trusted by | AWS managed policies |
+| Role | Trusted by | AWS managed policies |
 |---|---|---|
 | `platform-eks-cluster` | `eks.amazonaws.com` | `AmazonEKSClusterPolicy` |
 | `platform-eks-node` | `ec2.amazonaws.com` | `AmazonEKSWorkerNodePolicy`, `AmazonEKS_CNI_Policy`, `AmazonEC2ContainerRegistryReadOnly` |
 
-A delegation's `platform_roles` lets its users **pass** listed roles to listed
-services (the `poweruser` delegation: both roles, to `eks.amazonaws.com`).
-Validation keeps platform role names outside every prefix, so users can't
-change them.
+Trust policies are in `accounts/policies/platform-roles/`. Validation keeps
+platform role names outside every prefix, so users can't change them.
+Re-running the script resets the trust policy and attaches any new managed
+policies; it never detaches or deletes. After a rename, removal or
+`terraform destroy`, delete old roles by hand once nothing uses them.
 
-There is no destroy step: running workloads depend on these roles. After a
-rename, removal from `var.platform_roles`, or `terraform destroy`, delete the old
-roles by hand once nothing uses them.
-
-## GitHub Actions OIDC
+### GitHub OIDC provider
 
 `terraform_data.github_oidc` creates the IAM OIDC provider for
 `https://token.actions.githubusercontent.com` (audience `sts.amazonaws.com`) in
-every account. If a provider already exists, it is kept and the audience is
-added if missing. Users can't create OIDC providers. They create their own CI
-roles, under the boundary, that trust it.
+every account. An existing provider is kept, and the audience added if
+missing. Users can't create OIDC providers; they create their own CI roles,
+under the boundary, that trust this one. It is never deleted automatically.
 
-Users write those trust policies, and IAM can't check what a trust policy says.
-So `aws_organizations_policy.github_oidc`, a **resource control policy** on the
-OU, denies `sts:AssumeRoleWithWebIdentity` with a GitHub token unless its `sub`
-is `repo:<org>/*` for an org in `github_orgs`. The match is case-sensitive. A role
-that trusts every repo is then usable only from those orgs. Other web-identity
-federation is not affected.
+### Guardrails
 
-- **Test it after the first apply.** A workflow in a repo outside `github_orgs`
-  must get `AccessDenied` from `AssumeRoleWithWebIdentity`. If it doesn't, the RCP
-  isn't matching. Fix that before you rely on it.
-- If a GitHub org customizes its OIDC `sub` claim format, the pattern won't match
-  and the RCP blocks that org's workflows.
-- RCPs don't apply to the management account, so they don't affect the CI roles
-  from `bootstrap/github/setup.sh`.
-- The provider has no destroy step (CI roles depend on it). Remove it by hand if
-  it is retired.
+Two resource control policies (RCPs) on the OU. RCPs never apply to the
+management account.
 
-## Permission set provisioning
+- **`github-oidc-trusted-orgs`.** Users write their CI roles' trust policies,
+  and IAM can't check what a trust policy says. This RCP denies
+  `sts:AssumeRoleWithWebIdentity` with a GitHub token unless its `sub` matches
+  `repo:<org>/*` for an org in `github_orgs`, so even a role that trusts every
+  repository only works from those orgs. Other web-identity federation is not
+  affected. See [Known limitations](#known-limitations).
+- **`sts-assumerole-org-only`.** Users also control their roles' trust towards
+  other AWS accounts. This RCP denies `sts:AssumeRole` (and `TagSession`,
+  `SetSourceIdentity`) unless the caller is in the organization, is an AWS
+  service, or is in `trusted_external_account_ids`. Web-identity and SAML
+  federation are not affected.
 
-Terraform provisions the permission set after it attaches the
-customer-managed-policy reference. If the change doesn't reach the accounts (for
-example, provisioning failed in an account that didn't have the policy yet),
-provision once:
+### `bootstrap/state-bucket/`
 
-```bash
-aws sso-admin provision-permission-set \
-  --instance-arn <arn> --permission-set-arn <arn> \
-  --target-type ALL_PROVISIONED_ACCOUNTS
-```
+An S3 bucket for the `accounts/` state, with versioning, public access blocked,
+TLS required, and access only for IAM roles inside the organization. State is
+at `permissions/terraform.tfstate`, with native S3 locking (no DynamoDB table).
 
-## Teardown
+### GitHub repository and workflow
 
-`terraform destroy` detaches the delegation policies (and any permission-set
-boundaries) from the permission sets, deletes the RCPs, then runs
-`scripts/destroy-policies.sh` for each delegation to delete its policies in each
-account, delegation policy first. A policy still attached to an entity is left
-in place with a warning. Remove the reference, re-provision the permission set,
-then re-run. A role boundary is deleted only once no roles use it. Platform roles
-and the OIDC provider are never deleted automatically.
+**Setup script.** `bootstrap/github/setup.sh <settings.env> [step ...]` runs all
+steps, or the ones named. Each is idempotent:
 
-## Migrating from the single-permission-set layout
+| Step | Does |
+|---|---|
+| `preflight` | Checks tools, the `gh` login and scopes, and that the AWS credentials are for the management account. |
+| `repo` | Creates the repository; squash merges only; deletes branches on merge. |
+| `teams` | `GH_TEAM`: every org member except owners, with Write. `GH_APPROVER_TEAM`: only the approver, with Write. |
+| `actions` | Read-only `GITHUB_TOKEN` that can't approve pull requests; fork workflows wait for approval. |
+| `code` | Writes `.github/CODEOWNERS` (the approver); first push to an empty repository. |
+| `aws` | GitHub OIDC provider and the plan/apply roles in the management account. |
+| `environment` | `production`: the approver must approve; `main` only; admins can't bypass. |
+| `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
+| `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
+
+Settings are in `bootstrap/github/<org>.env`: organization, repository,
+visibility, approver, team names, environment, AWS region, state key, execution
+role and role name prefix.
+
+**AWS roles for the workflow** (management account):
+
+- `<prefix>-plan`: read-only Organizations and Identity Center access, state
+  read and lock. Trusted by pull requests and `main` of this repository.
+- `<prefix>-apply`: plan's access, plus state write, RCP management,
+  permission-set attachments, and assuming `execution_role_name` in accounts
+  of this organization only. Trusted only by jobs in the `production`
+  environment.
+
+The trust policies use the repository's exact OIDC subject prefix, read from
+GitHub. Newer repositories use immutable subjects
+(`repo:<org>@<org-id>/<repo>@<repo-id>`), which a renamed or re-created
+repository can't match.
+
+**Workflow files:**
+
+| File | Purpose |
+|---|---|
+| `.github/workflows/terraform.yml` | Jobs `plan` (pull requests), `plan-main` and `apply` (`main`). |
+| `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, masking of organization IDs, `terraform.tfvars` from the secret, `terraform init`. |
+| `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. |
+| `.github/CODEOWNERS` | Makes the approver the required reviewer. |
+
+### Files in `accounts/`
+
+| File | Purpose |
+|---|---|
+| `versions.tf` | Terraform ≥ 1.10, AWS provider ≥ 6.0, partial S3 backend. |
+| `providers.tf` | Default provider and the optional `aws.org` / `aws.idcaccount` aliases. |
+| `variables.tf` | Inputs and their validations. |
+| `delegations.tf` | Renders the templates and platform roles into the scripts' manifests. |
+| `main.tf` | Discovery, fan-outs, permission-set attachments, RCPs, migration blocks. |
+| `outputs.tf` | Outputs. |
+| `policies/delegations/<key>/` | Delegation templates. |
+| `policies/platform-roles/` | Platform role trust policies. |
+| `scripts/lib.sh` | Shared account loop: assume the execution role, run a step, collect failures. |
+| `scripts/apply-policies.sh`, `destroy-policies.sh` | Upsert / best-effort delete of one delegation's policies. |
+| `scripts/apply-platform-roles.sh` | Upsert one platform role. |
+| `scripts/apply-github-oidc.sh` | Create the GitHub OIDC provider. |
+| `backend.hcl.example`, `terraform.tfvars.example` | Copy, fill in, keep out of git. |
+| `.terraform.lock.hcl` | Provider lock file. Commit it. |
+
+### Known limitations
+
+- **GitHub immutable OIDC subjects.** Newer GitHub repositories issue tokens
+  with `sub` = `repo:<org>@<org-id>/<repo>@<repo-id>:…`. The
+  `github-oidc-trusted-orgs` RCP only matches `repo:<org>/…`, so workflows in
+  such repositories are denied in member accounts. A GitHub org that customizes
+  its `sub` claim format is blocked the same way.
+- **The plan isn't visible in CI.** Review the full diff locally.
+- **Org owners** can change the repository's rulesets and environment; GitHub
+  offers no way to prevent that.
+- **Team members can use the plan role** by editing the workflow in a pull
+  request. It is read-only, but can read the Terraform state, Organizations and
+  Identity Center configuration, and the tfvars secret.
+
+### Migrating from the single-permission-set layout
 
 Earlier versions took `permission_set_name`, `prefix`, `boundary_policy_name`,
 `delegation_policy_name`, `eks_cluster_role_name` and `eks_node_role_name`.
 Replace them with a `poweruser` entry in `delegations` that uses the same names
-(as in `terraform.tfvars.example`), and update the `TFVARS_BASE64` secret (`bootstrap/github/setup.sh <env> secrets`).
+(as in `terraform.tfvars.example`), and update the `TFVARS_BASE64` secret.
 
 `moved` blocks in `main.tf` map the old resources to the `poweruser` delegation
-and the `PowerUserAccess` permission set. If you used a different permission
-set name, edit the second `moved` block to match before you apply. The old
-`terraform_data.eks_roles` is dropped from state without deleting anything, and
-`terraform_data.platform_roles` takes over the existing roles.
+and the `PowerUserAccess` permission set; edit the second one if your
+permission set had another name. The old `terraform_data.eks_roles` is dropped
+from state without deleting anything, and `terraform_data.platform_roles` takes
+over the existing roles.
 
-The first apply replaces the `poweruser` policy resource once, because the
-trigger format changed. Its teardown leaves the delegation policy in place
-(attached to the permission set). In an account where no `app-` roles exist
-yet, it deletes the boundary, and the apply recreates it seconds later with the
-same ARN.
-
-The CI apply role created by `bootstrap/github/setup.sh` already has the
-permissions for permission-set boundaries.
+The trigger format changed, so the first apply replaces the `poweruser` policy
+resource once, with the teardown described in
+[Changing a delegation's policies](#changing-a-delegations-policies). To avoid
+it, run `terraform state rm terraform_data.delegated_iam_policies` before that
+apply; the new resource is then only created.
 
 ---
 
 ## Developer guide
 
-This section is for users of the power-user permission set (the `poweruser`
-delegation). Copy it to your
-internal docs as needed.
+This section is for users of the `PowerUserAccess` permission set (the
+`poweruser` delegation). Copy it to your internal docs as needed.
 
-The names below are the defaults from `accounts/variables.tf`: prefix `app-`,
-boundary `PowerUserRoleBoundary`, EKS roles `platform-eks-cluster` and
-`platform-eks-node`. If your deployment changes them, update this section to match.
-The example files are in [`examples/`](examples/). The commands
-below assume you run them from the repository root.
+The names below are this deployment's values: prefix `app-`, boundary
+`PowerUserRoleBoundary`, EKS roles `platform-eks-cluster` and
+`platform-eks-node`. Example files are in [`examples/`](examples/); the
+commands assume you run them from the repository root.
 
 ### Rules for all roles
 
@@ -452,45 +595,21 @@ below assume you run them from the repository root.
 3. Policies and instance profiles that you create must also start with `app-`.
 
 If you do not obey rules 1 and 2, AWS denies `CreateRole`. You cannot remove the
-boundary from a role later.
+boundary from a role later. Console options that "create a new role" for you
+fail, because their role names don't start with `app-`: create the role first,
+then select it.
 
 Your roles can only use these services: S3, DynamoDB, SQS, SNS, CloudWatch,
 CloudWatch Logs, SSM (including Session Manager), ECS and ECR. They also have
 `secretsmanager:GetSecretValue`, `kms:Decrypt` and `kms:GenerateDataKey`, and
 can be EventBridge target roles (`events:InvokeApiDestination` and
-`events:PutEvents` in the account). AWS
-denies all other actions, also if you attach a policy that allows them. Your
-roles cannot do IAM actions, with one exception: they can pass `app-` roles to
-ECS tasks (`iam:PassRole` to `ecs-tasks.amazonaws.com`). If you need a different
-service, tell the platform team.
+`events:PutEvents` in the account). AWS denies all other actions, even if you
+attach a policy that allows them. Your roles cannot do IAM actions, with one
+exception: they can pass `app-` roles to ECS tasks. If you need another
+service, ask the platform team.
 
 You yourself can pass `app-` roles to EC2, ECS tasks, EKS Pod Identity,
 EventBridge rules and EventBridge Scheduler, and the two platform roles to EKS.
-
-### Scheduled jobs (EventBridge)
-
-To call an HTTP endpoint on a schedule (for example a cron endpoint):
-
-1. Create an EventBridge **connection** (the endpoint's auth) and an **API
-   destination** for the endpoint.
-2. Create a role `app-<service>-eventbridge` with the permissions boundary and
-   this trust policy (replace `<account-id>`):
-   ```json
-   { "Version": "2012-10-17", "Statement": [{ "Effect": "Allow",
-     "Principal": { "Service": "events.amazonaws.com" }, "Action": "sts:AssumeRole",
-     "Condition": { "StringEquals": { "aws:SourceAccount": "<account-id>" } } }] }
-   ```
-   Give it a policy (name starting `app-`) that allows `events:InvokeApiDestination`
-   on the API destination's ARN.
-3. Create a rule with a schedule (`rate(...)` or `cron(...)`), target the API
-   destination, and select the role from step 2 under **Use existing role**.
-   The console's "create a new role" option fails: its role name doesn't start
-   with `app-`.
-
-Don't reuse an EC2 instance role: it trusts only `ec2.amazonaws.com`, so
-EventBridge can't assume it. For EventBridge Scheduler targets (ECS tasks, SQS,
-SNS), the role trusts `scheduler.amazonaws.com` instead. A schedule group has no
-role; the role belongs to each schedule.
 
 ### EC2 instance roles
 
@@ -531,8 +650,8 @@ aws ec2 associate-iam-instance-profile \
 6. Attach a policy to the task role. Give it only the permissions that your application needs.
 7. In the task definition, set `executionRoleArn` and `taskRoleArn` to the two new roles.
 
-You cannot change the name of an IAM role. If your roles do not start with
-`app-`, create new roles and update your task definitions.
+You cannot rename an IAM role. If your roles do not start with `app-`, create
+new roles and update your task definitions.
 
 You can register task definitions with your PowerUserAccess session or from a
 CD workflow. For a CD workflow, see [GitHub Actions](#github-actions).
@@ -551,6 +670,29 @@ CD workflow. For a CD workflow, see [GitHub Actions](#github-actions).
 You can use the two platform roles. You cannot change them.
 
 Do not use IRSA. IRSA needs an IAM OIDC provider, and you cannot create one.
+
+### Scheduled jobs (EventBridge)
+
+To call an HTTP endpoint on a schedule (for example a cron endpoint):
+
+1. Create an EventBridge **connection** (the endpoint's auth) and an **API
+   destination** for the endpoint.
+2. Create a role `app-<service>-eventbridge` with the permissions boundary and
+   this trust policy (replace `<account-id>`):
+   ```json
+   { "Version": "2012-10-17", "Statement": [{ "Effect": "Allow",
+     "Principal": { "Service": "events.amazonaws.com" }, "Action": "sts:AssumeRole",
+     "Condition": { "StringEquals": { "aws:SourceAccount": "<account-id>" } } }] }
+   ```
+   Give it a policy (name starting `app-`) that allows `events:InvokeApiDestination`
+   on the API destination's ARN.
+3. Create a rule with a schedule (`rate(...)` or `cron(...)`), target the API
+   destination, and select the role from step 2 under **Use existing role**.
+
+Don't reuse an EC2 instance role: it trusts only `ec2.amazonaws.com`, so
+EventBridge can't assume it. For EventBridge Scheduler targets (ECS tasks, SQS,
+SNS), the role trusts `scheduler.amazonaws.com` instead. A schedule group has
+no role; the role belongs to each schedule.
 
 ### GitHub Actions
 
@@ -572,7 +714,19 @@ workflows from other organizations.
 
 6. In the workflow, use the `aws-actions/configure-aws-credentials` action. Set `role-to-assume` to the ARN of your role. Set `aws-region` to your region.
 
-To deploy to ECS from the workflow, do these steps:
+**Check your repository's subject format first.** Newer repositories use
+immutable subjects, `repo:<org>@<org-id>/<repo>@<repo-id>:…`, instead of
+`repo:<org>/<repo>:…`. A repository admin can see which one yours uses:
+
+```bash
+gh api repos/<github-org>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix
+```
+
+Use that prefix in `sub`. Immutable subjects are currently blocked by the
+GitHub guardrail (see [Known limitations](#known-limitations)); ask the
+platform team if your repository uses them.
+
+To deploy to ECS from the workflow:
 
 1. Use the policy [`ecs-deploy-policy.json`](examples/ecs-deploy-policy.json) as the permissions policy. Name it `app-<repo>-deploy`.
 2. Replace `<region>`, `<account-id>`, `<repository>` and `<service>`.
