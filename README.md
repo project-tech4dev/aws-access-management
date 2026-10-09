@@ -108,14 +108,18 @@ example monitoring or security vendors). The
 ### 4. Set up the GitHub repository and CI access
 
 [`bootstrap/github/setup.sh`](bootstrap/github/setup.sh) holds every `gh` and
-AWS CLI command needed. It is idempotent. Copy its settings file for your
-organization:
+AWS CLI command needed. It is idempotent. Its settings are environment
+variables; see [GitHub repository and workflow](#github-repository-and-workflow)
+for the full list and defaults:
 
 ```bash
-cp bootstrap/github/settings.env.example bootstrap/github/settings.env   # fill in
 gh auth login -h github.com -s admin:org,workflow
-bootstrap/github/setup.sh bootstrap/github/settings.env
+GH_ORG=<github-org> GH_REPO=aws-access-management GH_APPROVER=<github-user> \
+  bootstrap/github/setup.sh
 ```
+
+The script stores the settings as Actions variables on the repository, so
+later runs need only `GH_ORG` and `GH_REPO`.
 
 It creates the repository, teams, Actions settings, `CODEOWNERS`, the AWS
 OIDC provider and plan/apply roles, the `production` environment, the secrets
@@ -204,7 +208,7 @@ and then open a pull request (any change under `accounts/` will do, or run the
 workflow on `main` by hand):
 
 ```bash
-bootstrap/github/setup.sh bootstrap/github/settings.env secrets
+GH_ORG=<github-org> GH_REPO=<repo> bootstrap/github/setup.sh secrets
 ```
 
 ### Adding or removing a delegation
@@ -232,7 +236,7 @@ list is a trigger. This is safe; the scripts are idempotent.
 ### Adding new org members to the team
 
 ```bash
-bootstrap/github/setup.sh bootstrap/github/settings.env teams
+GH_ORG=<github-org> GH_REPO=<repo> bootstrap/github/setup.sh teams
 ```
 
 This needs a `gh` user who is an org owner or the team's maintainer. Org owners
@@ -482,8 +486,8 @@ at `permissions/terraform.tfstate`, with native S3 locking (no DynamoDB table).
 
 ### GitHub repository and workflow
 
-**Setup script.** `bootstrap/github/setup.sh <settings.env> [step ...]` runs all
-steps, or the ones named. Each is idempotent:
+**Setup script.** `bootstrap/github/setup.sh [step ...]` runs all steps, or the
+ones named. Each is idempotent:
 
 | Step | Does |
 |---|---|
@@ -494,13 +498,28 @@ steps, or the ones named. Each is idempotent:
 | `code` | Writes `.github/CODEOWNERS` (the approver); first push to an empty repository. |
 | `aws` | GitHub OIDC provider and the plan/apply roles in the management account. |
 | `environment` | `production`: the approver must approve; `main` only; admins can't bypass. |
+| `variables` | Stores the settings below as repository Actions variables. |
 | `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
 | `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
 
-Settings are in `bootstrap/github/settings.env` (git-ignored; copy
-`settings.env.example`): organization, repository,
-visibility, approver, team names, environment, AWS region, state key, execution
-role and role name prefix.
+**Settings** are environment variables. Any not set in the environment are
+read from the repository's Actions variables, where the `variables` step
+stores them:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GH_ORG`, `GH_REPO` | required | Organization and repository. |
+| `GH_APPROVER` | required on first run | The only user who approves pull requests and applies. |
+| `GH_VISIBILITY` | `public` | `private` needs a paid GitHub plan for the approval gates. |
+| `GH_TEAM` | `<repo>` | Team of org members with Write. |
+| `GH_APPROVER_TEAM` | `<repo>-approvers` | Team of only the approver; may bypass review when merging a PR. |
+| `APPLY_ENVIRONMENT` | `production` | Environment the apply job runs in. |
+| `AWS_REGION` | `us-east-1` | Also used by the workflow. |
+| `STATE_KEY` | `permissions/terraform.tfstate` | Must match `accounts/versions.tf`. |
+| `EXECUTION_ROLE_NAME` | `OrganizationAccountAccessRole` | Role the fan-out assumes. |
+| `ROLE_NAME_PREFIX` | `github-<repo>` | Names of the plan and apply IAM roles. |
+| `STATE_BUCKET` | `bootstrap/state-bucket` output | Not stored as a variable (it's a secret). |
+| `TFVARS_FILE` | `accounts/terraform.tfvars` | Source of the `TFVARS_BASE64` secret. |
 
 **AWS roles for the workflow** (management account):
 

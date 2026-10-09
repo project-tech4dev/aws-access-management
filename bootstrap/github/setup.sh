@@ -4,42 +4,78 @@
 # Every step is idempotent; re-run it to repair drift or to add new org
 # members to the team.
 #
-#   bootstrap/github/setup.sh <config.env> [step ...]
+#   GH_ORG=<org> GH_REPO=<repo> [SETTING=value ...] bootstrap/github/setup.sh [step ...]
+#
+# Settings come from environment variables. The `variables` step stores them
+# as Actions variables on the repository, and later runs read any setting not
+# set in the environment from there, so only GH_ORG and GH_REPO are needed:
+#
+#   GH_ORG               GitHub organization (required)
+#   GH_REPO              repository name (required)
+#   GH_APPROVER          the only user who approves PRs and applies (required on first run)
+#   GH_VISIBILITY        public | private (default public; private needs a paid
+#                        GitHub plan for the approval gates)
+#   GH_TEAM              team of org members with Write (default <repo>)
+#   GH_APPROVER_TEAM     team of just GH_APPROVER, may bypass review via PR
+#                        (default <repo>-approvers)
+#   APPLY_ENVIRONMENT    environment the apply runs in (default production)
+#   AWS_REGION           default us-east-1
+#   STATE_KEY            must match accounts/versions.tf (default permissions/terraform.tfstate)
+#   EXECUTION_ROLE_NAME  role the fan-out assumes (default OrganizationAccountAccessRole)
+#   ROLE_NAME_PREFIX     IAM roles <prefix>-plan and -apply (default github-<repo>)
+#
+# Not stored: STATE_BUCKET (default: bootstrap/state-bucket output, stored as a
+# secret), TFVARS_FILE (default accounts/terraform.tfvars), COMMIT_MESSAGE.
 #
 # With no steps, runs all of them in this order:
 #
 #   preflight    check tools, logins and that AWS is the management account
 #   repo         create the repository (if missing) and set merge options
-#   teams        GH_TEAM = all current org members (Write);
+#   teams        GH_TEAM = org members except owners (Write);
 #                GH_APPROVER_TEAM = only GH_APPROVER (Write, ruleset bypass)
 #   actions      read-only GITHUB_TOKEN; approval for all fork PR workflows
 #   code         write .github/CODEOWNERS; first push to an empty repo
 #   aws          GitHub OIDC provider + plan/apply IAM roles in this account
 #   environment  APPLY_ENVIRONMENT: GH_APPROVER must approve; main only
+#   variables    the settings above as Actions variables
 #   secrets      role ARNs, state bucket and tfvars (base64) as Actions secrets
 #   rulesets     main: PR + passing "plan" check for everyone; code-owner
 #                (GH_APPROVER) review, bypassable via PR by GH_APPROVER_TEAM
 #
 # Requirements: gh (logged in with scopes repo, workflow, admin:org; an org
-# owner, or a member allowed to create repositories and teams), aws (management-account credentials), jq, git, terraform (only to
-# read the state bucket name when STATE_BUCKET is unset).
+# owner, or a member allowed to create repositories and teams), aws
+# (management-account credentials), jq, git, terraform (only to read the state
+# bucket name when STATE_BUCKET is unset).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-CONFIG="${1:?usage: $0 <config.env> [step ...]}"
-shift
-# shellcheck source=/dev/null
-source "$CONFIG"
+: "${GH_ORG:?set GH_ORG (GitHub organization)}" "${GH_REPO:?set GH_REPO (repository name)}"
+REPO="${GH_ORG}/${GH_REPO}"
 
-: "${GH_ORG:?}" "${GH_REPO:?}" "${GH_APPROVER:?}" "${GH_TEAM:?}" "${GH_APPROVER_TEAM:?}"
-: "${GH_VISIBILITY:=public}" "${APPLY_ENVIRONMENT:=production}"
-: "${AWS_REGION:=us-east-1}" "${STATE_KEY:=permissions/terraform.tfstate}"
+# Settings stored as repository Actions variables by the `variables` step.
+SETTINGS=(GH_APPROVER GH_VISIBILITY GH_TEAM GH_APPROVER_TEAM APPLY_ENVIRONMENT
+          AWS_REGION STATE_KEY EXECUTION_ROLE_NAME ROLE_NAME_PREFIX)
+
+# Fill unset settings from the repository's variables, if it exists.
+if gh repo view "$REPO" >/dev/null 2>&1; then
+  stored="$(gh variable list --repo "$REPO" --json name,value 2>/dev/null || echo '[]')"
+  for name in "${SETTINGS[@]}"; do
+    if [ -z "${!name:-}" ]; then
+      value="$(jq -r --arg n "$name" '.[] | select(.name == $n) | .value' <<< "$stored")"
+      [ -n "$value" ] && printf -v "$name" '%s' "$value"
+    fi
+  done
+fi
+
+: "${GH_APPROVER:?set GH_APPROVER (not stored on the repository yet)}"
+: "${GH_VISIBILITY:=public}" "${GH_TEAM:=$GH_REPO}" "${GH_APPROVER_TEAM:=${GH_REPO}-approvers}"
+: "${APPLY_ENVIRONMENT:=production}" "${AWS_REGION:=us-east-1}"
+: "${STATE_KEY:=permissions/terraform.tfstate}"
 : "${EXECUTION_ROLE_NAME:=OrganizationAccountAccessRole}"
 : "${ROLE_NAME_PREFIX:=github-${GH_REPO}}" "${TFVARS_FILE:=accounts/terraform.tfvars}"
 : "${COMMIT_MESSAGE:=Initial import}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REPO="${GH_ORG}/${GH_REPO}"
 OIDC_HOST="token.actions.githubusercontent.com"
 export AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
 
@@ -315,6 +351,16 @@ step_environment() {
 }
 
 # ---------------------------------------------------------------------------
+step_variables() {
+  say "variables"
+  local name
+  for name in "${SETTINGS[@]}"; do
+    gh variable set "$name" --repo "$REPO" --body "${!name}"
+  done
+  echo "ok: ${SETTINGS[*]}"
+}
+
+# ---------------------------------------------------------------------------
 step_secrets() {
   say "secrets"
   local account
@@ -329,7 +375,6 @@ step_secrets() {
   base64 < "$ROOT/$TFVARS_FILE" | tr -d '\n' | gh secret set TFVARS_BASE64 --repo "$REPO"
   gh secret set AWS_APPLY_ROLE_ARN --repo "$REPO" --env "$APPLY_ENVIRONMENT" \
     --body "arn:aws:iam::${account}:role/${ROLE_NAME_PREFIX}-apply"
-  gh variable set AWS_REGION --repo "$REPO" --body "$AWS_REGION"
   echo "ok"
 }
 
@@ -392,7 +437,7 @@ step_rulesets() {
 }
 
 # ---------------------------------------------------------------------------
-ALL_STEPS=(preflight repo teams actions code aws environment secrets rulesets)
+ALL_STEPS=(preflight repo teams actions code aws environment variables secrets rulesets)
 STEPS=("$@")
 [ "${#STEPS[@]}" -gt 0 ] || STEPS=("${ALL_STEPS[@]}")
 for s in "${STEPS[@]}"; do

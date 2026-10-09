@@ -16,5 +16,3 @@ backend.hcl
 .DS_Store
 plan.log
 
-# bootstrap/github settings (copy settings.env.example)
-bootstrap/github/*.env
