@@ -194,11 +194,15 @@ step_code() {
 # ---------------------------------------------------------------------------
 step_aws() {
   say "aws: OIDC provider and roles"
-  local account org_id full_name bucket provider_arn
+  local account org_id sub_prefix bucket provider_arn
   account="$(aws sts get-caller-identity --query Account --output text)"
   org_id="$(aws organizations describe-organization --query Organization.Id --output text)"
-  # GitHub's `sub` claim is case-sensitive; use the name exactly as GitHub reports it.
-  full_name="$(gh api "repos/$REPO" --jq .full_name)"
+  # The `sub` claim's repository part, exactly as GitHub issues it. Newer repos
+  # use immutable subjects ("repo:org@<id>/repo@<id>"), which a renamed or
+  # re-created repository can't match; older ones use "repo:org/repo".
+  sub_prefix="$(gh api "repos/$REPO/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty' 2>/dev/null || true)"
+  [ -n "$sub_prefix" ] || sub_prefix="repo:$(gh api "repos/$REPO" --jq .full_name)"
+  echo "OIDC subject prefix: $sub_prefix"
   bucket="$(state_bucket)"
   provider_arn="arn:aws:iam::${account}:oidc-provider/${OIDC_HOST}"
 
@@ -281,11 +285,11 @@ step_aws() {
   }
 
   # Plan: pull requests, and main (the post-merge plan the approver reviews).
-  upsert_role "${ROLE_NAME_PREFIX}-plan" "GitHub Actions: terraform plan for $full_name" \
-    "$(trust "repo:${full_name}:pull_request" "repo:${full_name}:ref:refs/heads/main")" "$plan_policy"
+  upsert_role "${ROLE_NAME_PREFIX}-plan" "GitHub Actions: terraform plan for $REPO" \
+    "$(trust "${sub_prefix}:pull_request" "${sub_prefix}:ref:refs/heads/main")" "$plan_policy"
   # Apply: only jobs in the protected environment.
-  upsert_role "${ROLE_NAME_PREFIX}-apply" "GitHub Actions: terraform apply for $full_name" \
-    "$(trust "repo:${full_name}:environment:${APPLY_ENVIRONMENT}")" "$apply_policy"
+  upsert_role "${ROLE_NAME_PREFIX}-apply" "GitHub Actions: terraform apply for $REPO" \
+    "$(trust "${sub_prefix}:environment:${APPLY_ENVIRONMENT}")" "$apply_policy"
 }
 
 # ---------------------------------------------------------------------------
