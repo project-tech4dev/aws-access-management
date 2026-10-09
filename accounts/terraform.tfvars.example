@@ -1,0 +1,48 @@
+# Copy to terraform.tfvars and fill in.
+
+region = "us-east-1"
+
+# OU to cover (or a root id r-xxxx for the whole org).
+ou_id = "ou-abcd-11111111"
+
+# Role the fan-out script assumes in each account under the OU. Must already
+# exist there and be assumable by the credentials Terraform runs as.
+execution_role_name = "OrganizationAccountAccessRole"
+
+# Delegations: who may create IAM roles, under which prefix and boundary.
+# Each key is a directory under policies/delegations/<key>/ holding
+# delegation.json.tftpl and role-boundary.json.tftpl (and optionally
+# permission-set-boundary.json.tftpl). See the README.
+delegations = {
+  poweruser = {
+    permission_sets        = ["PowerUserAccess"]
+    prefix                 = "app"
+    role_boundary_name     = "PowerUserRoleBoundary"
+    delegation_policy_name = "poweruser-iam-delegation"
+    pass_to_services       = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com", "pods.eks.amazonaws.com", "events.amazonaws.com", "scheduler.amazonaws.com"]
+    platform_roles = {
+      platform-eks-cluster = ["eks.amazonaws.com"]
+      platform-eks-node    = ["eks.amazonaws.com"]
+    }
+  }
+}
+
+# Platform roles (no boundary) created in every account. The default is the two
+# EKS roles above; override to add more. Names must not start with any prefix.
+# platform_roles = {
+#   platform-eks-cluster = { trust_policy_file = "eks-cluster-trust.json", managed_policies = ["AmazonEKSClusterPolicy"] }
+#   platform-eks-node    = { trust_policy_file = "eks-node-trust.json", managed_policies = ["AmazonEKSWorkerNodePolicy", "AmazonEKS_CNI_Policy", "AmazonEC2ContainerRegistryReadOnly"] }
+# }
+
+# REQUIRED. GitHub orgs whose Actions workflows may use the GitHub OIDC provider (case-sensitive).
+github_orgs = ["<your-github-org>"]
+
+# Optional. AWS accounts outside the org that may assume roles here (vendor
+# integrations). All other outside callers are denied sts:AssumeRole by an RCP.
+# trusted_external_account_ids = ["111122223333"]
+
+# Optional. Leave unset to use ambient credentials (e.g. running as the
+# management account). Set these if Terraform runs from a separate automation
+# account that must hop in for the Organizations / Identity Center calls.
+# org_role_arn        = "arn:aws:iam::111111111111:role/tf-delegated-iam-org"
+# idcaccount_role_arn = "arn:aws:iam::111111111111:role/tf-delegated-iam-idc"

@@ -1,0 +1,17 @@
+# Terraform working dirs and state (state lives in S3; never commit it)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+
+# Deployment-specific values (see the *.example files)
+*.tfvars
+!*.tfvars.example
+backend.hcl
+
+
+.DS_Store
+plan.log

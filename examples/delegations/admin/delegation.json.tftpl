@@ -1,0 +1,95 @@
+${jsonencode({
+  Version = "2012-10-17"
+  # AdministratorAccess already allows iam:*, so Allow statements here would add
+  # nothing. This delegation is Deny-only: it removes what admins must not do.
+  # Note that an in-account admin can usually find another way around Denies in
+  # an identity policy; use SCPs for limits admins must not bypass.
+  Statement = [
+    {
+      Sid      = "DenyRolesOutsidePrefix"
+      Effect   = "Deny"
+      Action   = "iam:CreateRole"
+      NotResource = "arn:aws:iam::${account_id}:role/${prefix}-*"
+    },
+    {
+      Sid      = "DenyRolesWithoutBoundary"
+      Effect   = "Deny"
+      Action   = ["iam:CreateRole", "iam:PutRolePermissionsBoundary"]
+      Resource = "*"
+      Condition = {
+        StringNotEquals = {
+          "iam:PermissionsBoundary" = "arn:aws:iam::${account_id}:policy/${role_boundary_name}"
+        }
+      }
+    },
+    {
+      Sid      = "DenyBoundaryRemoval"
+      Effect   = "Deny"
+      Action   = ["iam:DeleteRolePermissionsBoundary", "iam:DeleteUserPermissionsBoundary"]
+      Resource = "*"
+    },
+    {
+      Sid    = "DenyLongLivedCredentials"
+      Effect = "Deny"
+      Action = [
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "iam:UpdateLoginProfile",
+        "iam:CreateServiceSpecificCredential",
+      ]
+      Resource = "*"
+    },
+    # Protects the GitHub OIDC provider and blocks new federation paths.
+    {
+      Sid    = "DenyIdentityProviderChanges"
+      Effect = "Deny"
+      Action = [
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint",
+        "iam:AddClientIDToOpenIDConnectProvider",
+        "iam:RemoveClientIDFromOpenIDConnectProvider",
+        "iam:CreateSAMLProvider",
+        "iam:UpdateSAMLProvider",
+        "iam:DeleteSAMLProvider",
+      ]
+      Resource = "*"
+    },
+    # Every policy this configuration manages, including this one: admins can't
+    # detach it from their Identity Center role, but could otherwise rewrite it.
+    {
+      Sid    = "ProtectManagedPolicies"
+      Effect = "Deny"
+      Action = [
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+      ]
+      Resource = [for n in managed_policy_names : "arn:aws:iam::${account_id}:policy/${n}"]
+    },
+    # Platform roles and the role Terraform's fan-out uses.
+    {
+      Sid    = "ProtectPlatformAndExecutionRoles"
+      Effect = "Deny"
+      Action = [
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:TagRole",
+        "iam:UntagRole",
+      ]
+      Resource = [
+        for r in concat(all_platform_roles, [execution_role_name]) : "arn:aws:iam::${account_id}:role/${r}"
+      ]
+    },
+  ]
+})}

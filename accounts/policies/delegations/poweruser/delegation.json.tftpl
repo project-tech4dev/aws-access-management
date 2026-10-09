@@ -1,0 +1,129 @@
+${jsonencode({
+  Version = "2012-10-17"
+  Statement = concat(
+    [
+      # PowerUserAccess has no IAM permissions, so these Allows are the only IAM
+      # access holders get: roles, policies and instance profiles under the prefix.
+      {
+        Sid      = "CreateScopedRolesWithBoundary"
+        Effect   = "Allow"
+        Action   = ["iam:CreateRole", "iam:PutRolePermissionsBoundary"]
+        Resource = "arn:aws:iam::${account_id}:role/${prefix}-*"
+        Condition = {
+          StringEquals = {
+            "iam:PermissionsBoundary" = "arn:aws:iam::${account_id}:policy/${role_boundary_name}"
+          }
+        }
+      },
+      {
+        Sid    = "ManageScopedRoles"
+        Effect = "Allow"
+        Action = [
+          "iam:DeleteRole",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:UpdateRole",
+          "iam:UpdateRoleDescription",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:TagRole",
+          "iam:UntagRole",
+          "iam:GetRole",
+          "iam:GetRolePolicy",
+          "iam:ListRolePolicies",
+          "iam:ListAttachedRolePolicies",
+        ]
+        Resource = "arn:aws:iam::${account_id}:role/${prefix}-*"
+      },
+      {
+        Sid    = "ManageScopedPolicies"
+        Effect = "Allow"
+        Action = [
+          "iam:CreatePolicy",
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicy",
+          "iam:DeletePolicyVersion",
+          "iam:SetDefaultPolicyVersion",
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:ListPolicyVersions",
+        ]
+        Resource = "arn:aws:iam::${account_id}:policy/${prefix}-*"
+      },
+      {
+        Sid    = "ManageScopedInstanceProfiles"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateInstanceProfile",
+          "iam:DeleteInstanceProfile",
+          "iam:AddRoleToInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+          "iam:GetInstanceProfile",
+          "iam:TagInstanceProfile",
+          "iam:UntagInstanceProfile",
+        ]
+        Resource = "arn:aws:iam::${account_id}:instance-profile/${prefix}-*"
+      },
+      {
+        Sid    = "ReadOnlyIamForConsole"
+        Effect = "Allow"
+        Action = [
+          "iam:Get*",
+          "iam:List*",
+          "iam:GenerateServiceLastAccessedDetails",
+          "iam:SimulateCustomPolicy",
+          "iam:SimulatePrincipalPolicy",
+        ]
+        Resource = "*"
+      },
+    ],
+
+    # Prefixed roles may be passed to the delegation's pass_to_services.
+    length(pass_to_services) == 0 ? [] : [
+      {
+        Sid      = "PassScopedRoles"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = "arn:aws:iam::${account_id}:role/${prefix}-*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = pass_to_services }
+        }
+      },
+    ],
+
+    # Platform roles (no boundary, not modifiable by holders) may only be passed.
+    [
+      for name, services in platform_roles : {
+        Sid      = "PassPlatformRole${replace(title(name), "/[^0-9A-Za-z]/", "")}"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = "arn:aws:iam::${account_id}:role/${name}"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = services }
+        }
+      }
+    ],
+
+    [
+      {
+        Sid      = "PreventBoundaryRemoval"
+        Effect   = "Deny"
+        Action   = "iam:DeleteRolePermissionsBoundary"
+        Resource = "arn:aws:iam::${account_id}:role/${prefix}-*"
+      },
+      # Every policy this configuration manages, not just this delegation's.
+      {
+        Sid    = "ProtectManagedPolicies"
+        Effect = "Deny"
+        Action = [
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicy",
+          "iam:DeletePolicyVersion",
+          "iam:SetDefaultPolicyVersion",
+        ]
+        Resource = [for n in managed_policy_names : "arn:aws:iam::${account_id}:policy/${n}"]
+      },
+    ],
+  )
+})}

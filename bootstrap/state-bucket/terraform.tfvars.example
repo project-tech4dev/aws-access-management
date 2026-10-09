@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars and fill in. Apply with credentials for the account
+# that should hold the Terraform state (e.g. an automation account).
+bucket_name = "<globally-unique-bucket-name>"
+org_id      = "o-xxxxxxxxxx"

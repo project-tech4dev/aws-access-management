@@ -1,0 +1,66 @@
+name: terraform-setup
+description: >
+  Install Terraform, assume an AWS role via OIDC, mask organization identifiers
+  in the logs, write terraform.tfvars and run terraform init (in accounts/).
+
+inputs:
+  role-to-assume:
+    required: true
+  aws-region:
+    required: true
+  state-bucket:
+    required: true
+  tfvars:
+    description: Base64-encoded contents of accounts/terraform.tfvars.
+    required: true
+  terraform-version:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - uses: aws-actions/configure-aws-credentials@v5
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+        mask-aws-account-id: true
+
+    - name: Write terraform.tfvars
+      shell: bash
+      working-directory: accounts
+      env:
+        TFVARS: ${{ inputs.tfvars }}
+      run: printf '%s' "$TFVARS" | base64 -d > terraform.tfvars
+
+    # Logs of a public repository are public. Mask every identifier of the
+    # organization that Terraform or the fan-out scripts might print.
+    - name: Mask organization identifiers
+      shell: bash
+      working-directory: accounts
+      run: |
+        set -euo pipefail
+        mask() { local v; for v in "$@"; do if [ -n "$v" ] && [ "$v" != None ]; then echo "::add-mask::$v"; fi; done; }
+        mask $(aws organizations list-accounts --query 'Accounts[].Id' --output text)
+        mask "$(aws organizations describe-organization --query Organization.Id --output text)"
+        mask $(aws organizations list-roots --query 'Roots[].Id' --output text)
+        mask $(grep -oE '\b(ou-[a-z0-9]+-[a-z0-9]+|r-[a-z0-9]+)\b' terraform.tfvars || true)
+        for instance in $(aws sso-admin list-instances --query 'Instances[].InstanceArn' --output text); do
+          mask "${instance##*/}"
+          mask $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text)
+          for ps in $(aws sso-admin list-permission-sets --instance-arn "$instance" --query 'PermissionSets[]' --output text); do
+            mask "${ps##*/}"
+          done
+        done
+
+    - name: Init
+      shell: bash
+      working-directory: accounts
+      env:
+        STATE_BUCKET: ${{ inputs.state-bucket }}
+        STATE_REGION: ${{ inputs.aws-region }}
+      run: terraform init -no-color -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$STATE_REGION"

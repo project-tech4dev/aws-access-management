@@ -1,0 +1,132 @@
+name: terraform (accounts)
+
+# Pull request: plan (required check). Merge to main: plan, then apply after
+# the approver approves the "production" environment. The apply re-plans and
+# stops if the changes differ from the plan the approver reviewed.
+#
+# Set up by bootstrap/github/setup.sh:
+#   Secrets (repository):  AWS_PLAN_ROLE_ARN, TF_STATE_BUCKET, TFVARS_BASE64
+#   Secret (environment "production"): AWS_APPLY_ROLE_ARN
+#   Variable (repository): AWS_REGION
+#
+# The repository may be public, and so are its Actions logs. Values come from
+# secrets (masked), account/org/OU/SSO IDs are masked, and the logs show only
+# which resources change and how - never the plan's contents. Run
+# `terraform plan` locally to see the full diff.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - "accounts/**"
+      - ".github/workflows/terraform.yml"
+      - ".github/actions/terraform-setup/**"
+      - ".github/scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for AWS
+
+concurrency:
+  group: terraform-accounts-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false # never interrupt an apply
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VERSION: "1.10.5"
+
+defaults:
+  run:
+    working-directory: accounts
+
+jobs:
+  # Required status check on pull requests (ruleset "main: pull request and plan").
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # Fork PRs get no OIDC token, and a skipped job would count as passing.
+      - name: Require a branch in this repository
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        working-directory: .
+        run: |
+          echo "::error::Open the pull request from a branch in ${{ github.repository }}, not a fork (members of the repository team have write access)."
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/terraform-setup
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ secrets.TF_STATE_BUCKET }}
+          tfvars: ${{ secrets.TFVARS_BASE64 }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: terraform validate -no-color
+
+      - name: Plan
+        run: ../.github/scripts/plan-summary.sh
+
+  # Post-merge plan: what the approver reviews before approving the apply.
+  plan-main:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/terraform-setup
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ secrets.TF_STATE_BUCKET }}
+          tfvars: ${{ secrets.TFVARS_BASE64 }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Plan
+        id: plan
+        run: ../.github/scripts/plan-summary.sh
+
+  apply:
+    needs: plan-main
+    if: needs.plan-main.outputs.changes != ''
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/terraform-setup
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ secrets.TF_STATE_BUCKET }}
+          tfvars: ${{ secrets.TFVARS_BASE64 }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Plan
+        id: plan
+        run: ../.github/scripts/plan-summary.sh
+
+      - name: Check the plan matches the approved one
+        env:
+          APPROVED: ${{ needs.plan-main.outputs.changes }}
+          CURRENT: ${{ steps.plan.outputs.changes }}
+        run: |
+          if [ "$APPROVED" != "$CURRENT" ]; then
+            echo "::error::The plan changed since it was approved. Re-run the workflow to review the new plan."
+            exit 1
+          fi
+
+      # The fan-out scripts (local-exec) run here, using the apply role's
+      # credentials to assume the execution role in each member account.
+      - name: Apply
+        run: terraform apply -no-color -lock-timeout=5m -auto-approve tfplan

@@ -1,0 +1,115 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowedServiceCeiling",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*",
+        "dynamodb:*",
+        "sqs:*",
+        "sns:*",
+        "logs:*",
+        "cloudwatch:*",
+        "ssm:*",
+        "ecs:*",
+        "ecr:*",
+        "secretsmanager:GetSecretValue",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSSMSessionManager",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:UpdateInstanceInformation",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowEventBridgeTargets",
+      "Effect": "Allow",
+      "Action": [
+        "events:InvokeApiDestination",
+        "events:PutEvents"
+      ],
+      "Resource": [
+        "arn:aws:events:*:${account_id}:api-destination/*",
+        "arn:aws:events:*:${account_id}:event-bus/*"
+      ]
+    },
+    {
+      "Sid": "AllowPassScopedRolesToEcsTasks",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::${account_id}:role/${prefix}-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DenyPassRoleOutsidePrefix",
+      "Effect": "Deny",
+      "Action": "iam:PassRole",
+      "NotResource": "arn:aws:iam::${account_id}:role/${prefix}-*"
+    },
+    {
+      "Sid": "DenyPassRoleToOtherServices",
+      "Effect": "Deny",
+      "Action": "iam:PassRole",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DenyIamWrites",
+      "Effect": "Deny",
+      "Action": [
+        "iam:Add*",
+        "iam:Attach*",
+        "iam:Change*",
+        "iam:Create*",
+        "iam:Deactivate*",
+        "iam:Delete*",
+        "iam:Detach*",
+        "iam:Enable*",
+        "iam:Put*",
+        "iam:Remove*",
+        "iam:Reset*",
+        "iam:Resync*",
+        "iam:Set*",
+        "iam:Tag*",
+        "iam:Untag*",
+        "iam:Update*",
+        "iam:Upload*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyOrgAndAccountChanges",
+      "Effect": "Deny",
+      "Action": [
+        "organizations:*",
+        "account:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
