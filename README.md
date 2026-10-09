@@ -112,9 +112,9 @@ AWS CLI command needed. It is idempotent. Copy its settings file for your
 organization:
 
 ```bash
-cp bootstrap/github/project-tech4dev.env bootstrap/github/<your-org>.env   # edit the values
+cp bootstrap/github/settings.env.example bootstrap/github/settings.env   # fill in
 gh auth login -h github.com -s admin:org,workflow
-bootstrap/github/setup.sh bootstrap/github/<your-org>.env
+bootstrap/github/setup.sh bootstrap/github/settings.env
 ```
 
 It creates the repository, teams, Actions settings, `CODEOWNERS`, the AWS
@@ -204,7 +204,7 @@ and then open a pull request (any change under `accounts/` will do, or run the
 workflow on `main` by hand):
 
 ```bash
-bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env secrets
+bootstrap/github/setup.sh bootstrap/github/settings.env secrets
 ```
 
 ### Adding or removing a delegation
@@ -232,7 +232,7 @@ list is a trigger. This is safe; the scripts are idempotent.
 ### Adding new org members to the team
 
 ```bash
-bootstrap/github/setup.sh bootstrap/github/project-tech4dev.env teams
+bootstrap/github/setup.sh bootstrap/github/settings.env teams
 ```
 
 This needs a `gh` user who is an org owner or the team's maintainer. Org owners
@@ -497,7 +497,8 @@ steps, or the ones named. Each is idempotent:
 | `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
 | `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
 
-Settings are in `bootstrap/github/<org>.env`: organization, repository,
+Settings are in `bootstrap/github/settings.env` (git-ignored; copy
+`settings.env.example`): organization, repository,
 visibility, approver, team names, environment, AWS region, state key, execution
 role and role name prefix.
 
