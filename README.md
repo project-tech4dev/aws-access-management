@@ -23,7 +23,7 @@ It does this in every account under one OU (or the whole organization):
   from AWS accounts outside the organization.
 
 Changes are made by pull request. A GitHub Actions workflow plans every pull
-request and, after merge and the approver's sign-off, applies the change.
+request and, after merge and an approver's sign-off, applies the change.
 
 **Who should read what:**
 
@@ -108,18 +108,24 @@ example monitoring or security vendors). The
 ### 4. Set up the GitHub repository and CI access
 
 [`bootstrap/github/setup.sh`](bootstrap/github/setup.sh) holds every `gh` and
-AWS CLI command needed. It is idempotent. Its settings are environment
-variables; see [GitHub repository and workflow](#github-repository-and-workflow)
-for the full list and defaults:
+AWS CLI command needed. It is idempotent. Put its settings in
+`bootstrap/github/settings.env` (git-ignored, `KEY=value` lines), or pass them
+as environment variables; see
+[GitHub repository and workflow](#github-repository-and-workflow) for the list
+and defaults:
 
 ```bash
+cat > bootstrap/github/settings.env <<'SETTINGS'
+GH_ORG=<github-org>
+GH_REPO=aws-access-management
+GH_APPROVER=<github-user>,<github-user>
+SETTINGS
 gh auth login -h github.com -s admin:org,workflow
-GH_ORG=<github-org> GH_REPO=aws-access-management GH_APPROVER=<github-user> \
-  bootstrap/github/setup.sh
+bootstrap/github/setup.sh
 ```
 
-The script stores the settings as Actions variables on the repository, so
-later runs need only `GH_ORG` and `GH_REPO`.
+The script also stores the settings as Actions variables on the repository, so
+later runs without the file need only `GH_ORG` and `GH_REPO`.
 
 It creates the repository, teams, Actions settings, `CODEOWNERS`, the AWS
 OIDC provider and plan/apply roles, the `production` environment, the secrets
@@ -161,7 +167,7 @@ Every change goes through a pull request to `main`:
    and `plan`. It must pass.
 3. The approver reviews and approves the pull request, then it is merged.
 4. On `main`, the `plan-main` job plans again. If anything changes, the
-   `apply` job waits for the approver to approve the `production` environment.
+   `apply` job waits for an approver to approve the `production` environment.
 5. After approval, `apply` plans once more and stops if the list of changed
    resources differs from what was approved, then applies.
 
@@ -169,7 +175,7 @@ Every change goes through a pull request to `main`:
 |---|---|
 | Org members (team `aws-access-management`) | Push branches and open pull requests. |
 | Org owners | Everything a repository admin can, including changing rulesets and the environment. |
-| The approver (`GH_APPROVER`) | Approve pull requests (as code owner); approve applies; merge their own pull requests without an approval, but only through a pull request. |
+| Approvers (`GH_APPROVER`) | Approve pull requests (as code owners; one approval is enough); approve applies; merge their own pull requests without an approval, but only through a pull request. |
 | Anyone | Push to `main` directly: nobody can. Skip the `plan` check: nobody can. |
 
 **The plan is not shown in the logs.** The repository is public, and so are its
@@ -493,26 +499,26 @@ ones named. Each is idempotent:
 |---|---|
 | `preflight` | Checks tools, the `gh` login and scopes, and that the AWS credentials are for the management account. |
 | `repo` | Creates the repository; squash merges only; deletes branches on merge. |
-| `teams` | `GH_TEAM`: every org member except owners, with Write. `GH_APPROVER_TEAM`: only the approver, with Write. |
+| `teams` | `GH_TEAM`: every org member except owners, with Write. `GH_APPROVER_TEAM`: only the approvers, with Write. |
 | `actions` | Read-only `GITHUB_TOKEN` that can't approve pull requests; fork workflows wait for approval. |
-| `code` | Writes `.github/CODEOWNERS` (the approver); first push to an empty repository. |
+| `code` | Writes `.github/CODEOWNERS` (the approvers); first push to an empty repository. |
 | `aws` | GitHub OIDC provider and the plan/apply roles in the management account. |
-| `environment` | `production`: the approver must approve; `main` only; admins can't bypass. |
+| `environment` | `production`: an approver must approve; `main` only; admins can't bypass. |
 | `variables` | Stores the settings below as repository Actions variables. |
 | `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
 | `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
 
-**Settings** are environment variables. Any not set in the environment are
-read from the repository's Actions variables, where the `variables` step
-stores them:
+**Settings** are read, in order of priority, from environment variables,
+`bootstrap/github/settings.env` (git-ignored; another file via `SETTINGS_FILE`),
+and the repository's Actions variables, where the `variables` step stores them:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `GH_ORG`, `GH_REPO` | required | Organization and repository. |
-| `GH_APPROVER` | required on first run | The only user who approves pull requests and applies. |
+| `GH_APPROVER` | required on first run | Comma-separated users (at most 6) who approve pull requests and applies. One approval is enough. |
 | `GH_VISIBILITY` | `public` | `private` needs a paid GitHub plan for the approval gates. |
 | `GH_TEAM` | `<repo>` | Team of org members with Write. |
-| `GH_APPROVER_TEAM` | `<repo>-approvers` | Team of only the approver; may bypass review when merging a PR. |
+| `GH_APPROVER_TEAM` | `<repo>-approvers` | Team of only the approvers; may bypass review when merging a PR. |
 | `APPLY_ENVIRONMENT` | `production` | Environment the apply job runs in. |
 | `AWS_REGION` | `us-east-1` | Also used by the workflow. |
 | `STATE_KEY` | `permissions/terraform.tfstate` | Must match `accounts/versions.tf`. |
@@ -542,7 +548,7 @@ repository can't match.
 | `.github/workflows/terraform.yml` | Jobs `plan` (pull requests), `plan-main` and `apply` (`main`). |
 | `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, masking of organization IDs, `terraform.tfvars` from the secret, `terraform init`. |
 | `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. |
-| `.github/CODEOWNERS` | Makes the approver the required reviewer. |
+| `.github/CODEOWNERS` | Makes the approvers the required reviewers. |
 
 ### Files in `accounts/`
 
