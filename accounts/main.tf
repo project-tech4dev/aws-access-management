@@ -72,7 +72,6 @@ resource "terraform_data" "delegated_iam_policies" {
     execution_role = var.execution_role_name
     policy_names   = jsonencode([for p in local.delegation_policies[each.key] : p.name])
     region         = var.region
-    module_dir     = abspath(path.module)
   }
 
   lifecycle {
@@ -93,9 +92,11 @@ resource "terraform_data" "delegated_iam_policies" {
     }
   }
 
+  # path.module, not a stored absolute path: the script must be found on
+  # whichever machine runs the destroy (a CI runner or a laptop).
   provisioner "local-exec" {
     when        = destroy
-    command     = "${self.output.module_dir}/scripts/destroy-policies.sh"
+    command     = "${path.module}/scripts/destroy-policies.sh"
     interpreter = ["/usr/bin/env", "bash"]
     environment = {
       ACCOUNT_IDS   = self.output.account_ids
