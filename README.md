@@ -165,7 +165,7 @@ Every change goes through a pull request to `main`:
    credentials, so their `plan` check fails.
 2. Open a pull request. The `plan` job runs `terraform fmt -check`, `validate`
    and `plan`. It must pass.
-3. The approver reviews and approves the pull request, then it is merged.
+3. An approver reviews and approves the pull request, then it is merged.
 4. On `main`, the `plan-main` job plans again. If anything changes, the
    `apply` job waits for an approver to approve the `production` environment.
 5. After approval, `apply` plans once more and stops if the list of changed
