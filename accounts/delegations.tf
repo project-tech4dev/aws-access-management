@@ -82,12 +82,35 @@ locals {
   }
 
   # Identity Center: one attachment per (delegation, permission set) pair.
-  permission_set_names = toset(flatten([for d in values(var.delegations) : d.permission_sets]))
+  permission_set_names = toset(concat(
+    flatten([for d in values(var.delegations) : d.permission_sets]),
+    [for a in values(var.account_assignments) : a.permission_set],
+  ))
   permission_set_attachments = merge([
     for k, d in var.delegations : {
       for ps in d.permission_sets : "${k}/${ps}" => { delegation = k, permission_set = ps }
     }
   ]...)
+
+  # One assignment per (permission set, principal, account). Keyed by those
+  # rather than the var.account_assignments key, so an assignment reached from
+  # two entries (an OU and one of its accounts) is managed once, and renaming an
+  # entry changes nothing.
+  account_assignments = merge(flatten([
+    for k, a in var.account_assignments : [
+      for p in concat(
+        [for g in a.groups : { type = "GROUP", name = g }],
+        [for u in a.users : { type = "USER", name = u }],
+        ) : {
+        for acct in local.assignment_account_ids[k] : "${a.permission_set}/${p.type}:${p.name}/${acct}" => {
+          permission_set = a.permission_set
+          principal_type = p.type
+          principal      = p.name
+          account_id     = acct
+        }
+      }
+    ]
+  ])...)
 
   # A permission set can have only one permissions boundary.
   bounded_permission_sets = flatten([

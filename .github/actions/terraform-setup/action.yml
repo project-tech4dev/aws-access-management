@@ -52,6 +52,13 @@ runs:
         for instance in $(aws sso-admin list-instances --query 'Instances[].InstanceArn' --output text); do
           mask "${instance##*/}"
           mask $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text)
+          # Group and user names appear in account assignment addresses.
+          for store in $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text); do
+            while IFS=$'\t' read -r id name; do mask "$id" "$name"; done < <(
+              aws identitystore list-groups --identity-store-id "$store" --query 'Groups[].[GroupId,DisplayName]' --output text)
+            while IFS=$'\t' read -r id name; do mask "$id" "$name"; done < <(
+              aws identitystore list-users --identity-store-id "$store" --query 'Users[].[UserId,UserName]' --output text)
+          done
           for ps in $(aws sso-admin list-permission-sets --instance-arn "$instance" --query 'PermissionSets[]' --output text); do
             mask "${ps##*/}"
           done

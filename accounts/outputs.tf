@@ -1,5 +1,5 @@
 output "target_account_ids" {
-  description = "ACTIVE accounts under the OU that receive the policies."
+  description = "ACTIVE accounts assigned a delegation's permission set; they receive the policies."
   value       = local.target_account_ids
 }
 
@@ -16,4 +16,9 @@ output "permission_set_arns" {
 output "delegation_policies" {
   description = "Policy names each delegation creates in every account, in creation order."
   value       = { for k, policies in local.delegation_policies : k => [for p in policies : p.name] }
+}
+
+output "account_assignments" {
+  description = "Assignments Terraform manages, as \"<permission set>/<GROUP|USER>:<name>/<account id>\"."
+  value       = sort(keys(local.account_assignments))
 }

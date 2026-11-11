@@ -2,11 +2,30 @@
 
 region = "us-east-1"
 
-# OU to cover (or a root id r-xxxx for the whole org).
-ou_id = "ou-abcd-11111111"
+# Who gets which permission set where, keyed by any name. An OU covers every
+# ACTIVE account beneath it (accounts added later are assigned on the next
+# apply). Groups and users must already exist in Identity Center.
+#
+# Every OU and account a delegation's permission set (here PowerUserAccess) is
+# assigned to also gets the delegation policies, platform roles, GitHub OIDC
+# provider and RCPs. Never assign those to the management account.
+account_assignments = {
+  nonprod-poweruser = {
+    permission_set = "PowerUserAccess"
+    groups         = ["Developers"]
+    ous            = ["ou-abcd-11111111"]
+  }
+  billing-readonly = {
+    permission_set = "ReadOnlyAccess"
+    groups         = ["Finance"]
+    users          = ["jane@example.org"]
+    accounts       = ["111122223333"]
+  }
+}
 
-# Role the fan-out script assumes in each account under the OU. Must already
-# exist there and be assumable by the credentials Terraform runs as.
+# Role the fan-out script assumes in each account a delegation's permission set
+# is assigned to. Must already exist there and be assumable by the credentials
+# Terraform runs as.
 execution_role_name = "OrganizationAccountAccessRole"
 
 # Delegations: who may create IAM roles, under which prefix and boundary.
