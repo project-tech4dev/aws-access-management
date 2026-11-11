@@ -3,7 +3,10 @@
 # Run `terraform plan -out=tfplan` without printing the plan, and report only
 # which resources change and how (logs of a public repository are public).
 #
-# Writes to $GITHUB_OUTPUT:  changes=<sorted "action address" list, ";"-joined>
+# Writes to $GITHUB_OUTPUT:  digest=<sha256 of the sorted "action address" list>,
+#                            empty when nothing changes. A digest, not the list:
+#                            addresses contain masked values (account IDs, group
+#                            names), and GitHub drops job outputs that do.
 # Writes to $GITHUB_STEP_SUMMARY: the same list as a table.
 # Run from accounts/.
 # ---------------------------------------------------------------------------
@@ -36,4 +39,6 @@ changes="$(terraform show -json tfplan | jq -r '
 } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
 if [ -n "$changes" ]; then tr ';' '\n' <<< "$changes"; else echo "No changes."; fi
-echo "changes=$changes" >> "${GITHUB_OUTPUT:-/dev/null}"
+digest=""
+if [ -n "$changes" ]; then digest="$(printf '%s' "$changes" | sha256sum | cut -d' ' -f1)"; fi
+echo "digest=$digest" >> "${GITHUB_OUTPUT:-/dev/null}"

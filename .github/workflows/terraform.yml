@@ -80,7 +80,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     outputs:
-      changes: ${{ steps.plan.outputs.changes }}
+      digest: ${{ steps.plan.outputs.digest }}
     steps:
       - uses: actions/checkout@v5
 
@@ -98,7 +98,7 @@ jobs:
 
   apply:
     needs: plan-main
-    if: needs.plan-main.outputs.changes != ''
+    if: needs.plan-main.outputs.digest != ''
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -118,8 +118,8 @@ jobs:
 
       - name: Check the plan matches the approved one
         env:
-          APPROVED: ${{ needs.plan-main.outputs.changes }}
-          CURRENT: ${{ steps.plan.outputs.changes }}
+          APPROVED: ${{ needs.plan-main.outputs.digest }}
+          CURRENT: ${{ steps.plan.outputs.digest }}
         run: |
           if [ "$APPROVED" != "$CURRENT" ]; then
             echo "::error::The plan changed since it was approved. Re-run the workflow to review the new plan."
