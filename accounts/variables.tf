@@ -18,15 +18,59 @@ variable "idcaccount_role_arn" {
   nullable    = true
 }
 
-variable "ou_id" {
-  description = "OU to cover (e.g. ou-abcd-11111111), or a root id (r-xxxx). Leave null to cover the WHOLE org - the root id is discovered from the Organizations API. Applied to every ACTIVE account beneath it, including nested OUs."
-  type        = string
-  default     = null
-  nullable    = true
+variable "account_assignments" {
+  description = <<-EOT
+    Identity Center assignments, keyed by any name you like: each entry gives its
+    groups and users one permission set in its OUs and accounts. An OU covers
+    every ACTIVE account beneath it, including nested OUs, and accounts added
+    later are assigned on the next apply.
+
+    Every OU and account a delegation's permission set is assigned to also gets
+    that delegation's policies, the platform roles, the GitHub OIDC provider and
+    the RCPs. Assign those permission sets only to member accounts, never the
+    management account (or the root, which contains it).
+
+      permission_set  Identity Center permission set name.
+      groups          Group display names, exactly as in Identity Center.
+      users           User names (usually the email address).
+      ous             OU ids (ou-xxxx-xxxxxxxx).
+      accounts        Account ids.
+  EOT
+  type = map(object({
+    permission_set = string
+    groups         = optional(list(string), [])
+    users          = optional(list(string), [])
+    ous            = optional(list(string), [])
+    accounts       = optional(list(string), [])
+  }))
+
+  validation {
+    condition     = alltrue([for a in values(var.account_assignments) : length(a.groups) + length(a.users) > 0])
+    error_message = "Every account assignment needs at least one group or user."
+  }
+
+  validation {
+    condition     = alltrue([for a in values(var.account_assignments) : length(a.ous) + length(a.accounts) > 0])
+    error_message = "Every account assignment needs at least one OU or account."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for a in values(var.account_assignments) : [for ou in a.ous : can(regex("^(ou-[a-z0-9]+-[a-z0-9]+|r-[a-z0-9]+)$", ou))]
+    ]))
+    error_message = "ous must be OU ids (ou-xxxx-xxxxxxxx) or a root id (r-xxxx)."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for a in values(var.account_assignments) : [for id in a.accounts : can(regex("^[0-9]{12}$", id))]
+    ]))
+    error_message = "accounts must be 12-digit AWS account ids."
+  }
 }
 
 variable "execution_role_name" {
-  description = "Role the fan-out script assumes in each target account to create the policies. Must already exist in every account under the OU and be assumable by the credentials Terraform runs as."
+  description = "Role the fan-out script assumes in each target account to create the policies. Must already exist in every account a delegation's permission set is assigned to, and be assumable by the credentials Terraform runs as."
   type        = string
   default     = "OrganizationAccountAccessRole"
 }
@@ -165,7 +209,7 @@ variable "platform_roles" {
 }
 
 variable "github_orgs" {
-  description = "GitHub organizations whose Actions workflows may assume roles via the GitHub OIDC provider. Enforced by an RCP on the OU. Case-sensitive, exactly as the org name appears in GitHub."
+  description = "GitHub organizations whose Actions workflows may assume roles via the GitHub OIDC provider. Enforced by an RCP on the target OUs and accounts. Case-sensitive, exactly as the org name appears in GitHub."
   type        = list(string)
 
   validation {
@@ -175,7 +219,7 @@ variable "github_orgs" {
 }
 
 variable "trusted_external_account_ids" {
-  description = "AWS account IDs outside the org that may still assume roles in accounts under the OU (e.g. monitoring or security vendors). Everything else outside the org is denied by an RCP."
+  description = "AWS account IDs outside the org that may still assume roles in the target accounts (e.g. monitoring or security vendors). Everything else outside the org is denied by an RCP."
   type        = list(string)
   default     = []
 

@@ -7,10 +7,11 @@ data "aws_ssoadmin_instances" "this" {
 }
 
 locals {
-  sso_instance_arn = tolist(data.aws_ssoadmin_instances.this.arns)[0]
+  sso_instance_arn  = tolist(data.aws_ssoadmin_instances.this.arns)[0]
+  identity_store_id = tolist(data.aws_ssoadmin_instances.this.identity_store_ids)[0]
 }
 
-# Every permission set named by any delegation.
+# Every permission set named by a delegation or an account assignment.
 data "aws_ssoadmin_permission_set" "this" {
   for_each = local.permission_set_names
 
@@ -19,40 +20,90 @@ data "aws_ssoadmin_permission_set" "this" {
   name         = each.key
 }
 
-# The org itself - used to discover the root id when var.ou_id is not set.
+# Groups and users named by an account assignment, by display name / user name.
+# They must already exist (e.g. synced from the IdP); Terraform doesn't create them.
+data "aws_identitystore_group" "this" {
+  for_each = toset(flatten([for a in values(var.account_assignments) : a.groups]))
+
+  provider          = aws.idcaccount
+  identity_store_id = local.identity_store_id
+
+  alternate_identifier {
+    unique_attribute {
+      attribute_path  = "DisplayName"
+      attribute_value = each.key
+    }
+  }
+}
+
+data "aws_identitystore_user" "this" {
+  for_each = toset(flatten([for a in values(var.account_assignments) : a.users]))
+
+  provider          = aws.idcaccount
+  identity_store_id = local.identity_store_id
+
+  alternate_identifier {
+    unique_attribute {
+      attribute_path  = "UserName"
+      attribute_value = each.key
+    }
+  }
+}
+
 data "aws_organizations_organization" "current" {
   provider = aws.org
 }
 
-locals {
-  # Fall back to the org root (r-xxxx) so an unset var.ou_id means "the whole org".
-  ou_id = coalesce(var.ou_id, data.aws_organizations_organization.current.roots[0].id)
-}
+# All accounts beneath each OU named by an assignment, recursively (including
+# nested OUs).
+data "aws_organizations_organizational_unit_descendant_accounts" "assignment_ous" {
+  for_each = toset(flatten([for a in values(var.account_assignments) : a.ous]))
 
-# All accounts beneath the OU, recursively (including nested OUs).
-data "aws_organizations_organizational_unit_descendant_accounts" "targets" {
   provider  = aws.org
-  parent_id = local.ou_id
+  parent_id = each.key
 }
 
 locals {
-  # Only ACTIVE accounts: a SUSPENDED (closed) account can't be assumed into and
-  # the fan-out script treats an assume-role failure as fatal.
-  target_account_ids = sort([
-    for a in data.aws_organizations_organizational_unit_descendant_accounts.targets.accounts :
-    a.id if a.status == "ACTIVE"
-  ])
+  active_account_ids = [
+    for a in data.aws_organizations_organization.current.accounts : a.id if a.status == "ACTIVE"
+  ]
+
+  # Each assignment's accounts: those it lists plus every ACTIVE account beneath
+  # its OUs. A SUSPENDED (closed) account under an OU is skipped; a listed one
+  # fails the assignment's precondition.
+  assignment_account_ids = {
+    for k, a in var.account_assignments : k => sort(distinct(concat(a.accounts, flatten([
+      for ou in a.ous : [
+        for acct in data.aws_organizations_organizational_unit_descendant_accounts.assignment_ous[ou].accounts :
+        acct.id if acct.status == "ACTIVE"
+      ]
+    ]))))
+  }
+
+  # Assignments of a delegation's permission set. Everything the delegations
+  # need follows them: the fan-out covers their accounts and the RCPs are
+  # attached to their OUs and accounts.
+  delegation_permission_sets = toset(flatten([for d in values(var.delegations) : d.permission_sets]))
+  delegated_assignments = {
+    for k, a in var.account_assignments : k => a if contains(local.delegation_permission_sets, a.permission_set)
+  }
+
+  target_account_ids = sort(distinct(flatten([
+    for k in keys(local.delegated_assignments) : local.assignment_account_ids[k]
+  ])))
+  rcp_target_ids = toset(flatten([for a in values(local.delegated_assignments) : concat(a.ous, a.accounts)]))
 }
 
 # ---------------------------------------------------------------------------
 # Policy fan-out, one resource per delegation: a script assumes
 # var.execution_role_name in each target account and upserts that delegation's
-# policies (rendered in delegations.tf) there.
+# policies (rendered in delegations.tf) there. The target accounts are those
+# assigned a delegation's permission set in var.account_assignments.
 #
 # Re-runs whenever the account set or the rendered policies change. Replacing a
 # delegation first runs its destroy-time teardown, which leaves attached
 # policies in place. Removing a delegation from var.delegations tears down only
-# its policies. New accounts added to the OU are picked up on the next
+# its policies. New accounts under an assigned OU are picked up on the next
 # `terraform apply`.
 # ---------------------------------------------------------------------------
 
@@ -78,6 +129,15 @@ resource "terraform_data" "delegated_iam_policies" {
     precondition {
       condition     = alltrue([for p in local.delegation_policies[each.key] : length(p.document) <= 6144])
       error_message = "A rendered policy in delegation \"${each.key}\" exceeds the 6,144-character managed policy limit."
+    }
+    precondition {
+      condition     = length(local.target_account_ids) > 0
+      error_message = "No account_assignments entry assigns a delegation's permission set, so there is no account to create the delegation policies in."
+    }
+    # The fan-out can't assume the execution role there, and RCPs don't apply to it.
+    precondition {
+      condition     = !contains(local.target_account_ids, data.aws_organizations_organization.current.master_account_id)
+      error_message = "A delegation's permission set is assigned to the management account (directly or through an OU such as the root). Assign it to member accounts or OUs only."
     }
   }
 
@@ -177,8 +237,9 @@ resource "terraform_data" "github_oidc" {
 # Guardrail for the provider above. Users write their CI roles' trust policies,
 # and IAM can't inspect a trust policy's contents, so nothing stops a role that
 # trusts every GitHub repo (no or wildcard `sub` condition). This resource
-# control policy denies GitHub web-identity role assumption in every account
-# under the OU unless the token comes from one of var.github_orgs.
+# control policy denies GitHub web-identity role assumption in every target
+# account unless the token comes from one of var.github_orgs. It is attached to
+# each OU and account a delegation's permission set is assigned to.
 #
 # Prerequisite: RCPs enabled on the org root (one-time, management account):
 #   aws organizations enable-policy-type --root-id r-xxxx \
@@ -225,16 +286,18 @@ resource "aws_organizations_policy" "github_oidc" {
 }
 
 resource "aws_organizations_policy_attachment" "github_oidc" {
+  for_each = local.rcp_target_ids
+
   provider  = aws.org
   policy_id = aws_organizations_policy.github_oidc.id
-  target_id = local.ou_id
+  target_id = each.key
 }
 
 # ---------------------------------------------------------------------------
 # Data perimeter for role assumption. Users write their roles' trust policies,
 # so nothing in IAM stops an `app-` role from trusting an account outside the
-# org. This resource control policy denies sts:AssumeRole in every account
-# under the OU unless the caller is in this org, is an AWS service, or is one
+# org. This resource control policy denies sts:AssumeRole in every target
+# account (attached like the one above) unless the caller is in this org, is an AWS service, or is one
 # of var.trusted_external_account_ids (third-party integrations).
 #
 # Web-identity and SAML federation are not affected (different actions).
@@ -288,9 +351,11 @@ resource "aws_organizations_policy" "sts_org_only" {
 }
 
 resource "aws_organizations_policy_attachment" "sts_org_only" {
+  for_each = local.rcp_target_ids
+
   provider  = aws.org
   policy_id = aws_organizations_policy.sts_org_only.id
-  target_id = local.ou_id
+  target_id = each.key
 }
 
 # ---------------------------------------------------------------------------
@@ -343,6 +408,46 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "delegation" {
   }
 
   depends_on = [terraform_data.delegated_iam_policies]
+}
+
+# ---------------------------------------------------------------------------
+# Account assignments: who gets which permission set in which account. An OU in
+# var.account_assignments expands to its ACTIVE accounts (Identity Center
+# assigns per account), so accounts added under it are assigned on the next
+# apply.
+#
+# depends_on: a permission set that references a delegation policy fails to
+# provision in an account where that policy doesn't exist yet. The attachments
+# depend on the fan-out, so a newly covered account gets its policies first.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssoadmin_account_assignment" "this" {
+  for_each = local.account_assignments
+
+  provider           = aws.idcaccount
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = data.aws_ssoadmin_permission_set.this[each.value.permission_set].arn
+
+  principal_type = each.value.principal_type
+  principal_id = (each.value.principal_type == "GROUP"
+    ? data.aws_identitystore_group.this[each.value.principal].group_id
+    : data.aws_identitystore_user.this[each.value.principal].user_id
+  )
+
+  target_type = "AWS_ACCOUNT"
+  target_id   = each.value.account_id
+
+  lifecycle {
+    precondition {
+      condition     = contains(local.active_account_ids, each.value.account_id)
+      error_message = "Account ${each.value.account_id} is not an ACTIVE account in this organization."
+    }
+  }
+
+  depends_on = [
+    aws_ssoadmin_customer_managed_policy_attachment.delegation,
+    aws_ssoadmin_permissions_boundary_attachment.delegation,
+  ]
 }
 
 # ---------------------------------------------------------------------------

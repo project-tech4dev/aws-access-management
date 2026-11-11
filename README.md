@@ -6,7 +6,11 @@ IAM roles. It lets users of IAM Identity Center permission sets (for example
 instance roles, ECS task roles and CI roles, without being able to give
 those roles, or themselves, more access than the platform team allows.
 
-It does this in every account under one OU (or the whole organization):
+- **Account assignments.** Which groups and users get which permission set, in
+  which OUs and accounts. An OU covers every account beneath it, including
+  accounts added later.
+
+Wherever a delegation's permission set is assigned, it also sets up:
 
 - **Delegations.** Each delegation gives one or more permission sets the right
   to create IAM roles, policies and instance profiles under a naming prefix
@@ -18,7 +22,7 @@ It does this in every account under one OU (or the whole organization):
   the services that need them, but can't change them.
 - **GitHub Actions OIDC provider** in every account, so teams can give their
   workflows AWS access without long-lived keys.
-- **Guardrails** (resource control policies on the OU): only approved GitHub
+- **Guardrails** (resource control policies on those OUs and accounts): only approved GitHub
   organizations can use the GitHub OIDC provider, and roles can't be assumed
   from AWS accounts outside the organization.
 
@@ -30,7 +34,7 @@ request and, after merge and an approver's sign-off, applies the change.
 | You are | Read |
 |---|---|
 | Setting this up in a new organization | [One-time setup](#one-time-setup) |
-| Changing policies, delegations or accounts | [Day-to-day operations](#day-to-day-operations) |
+| Changing assignments, policies, delegations or accounts | [Day-to-day operations](#day-to-day-operations) |
 | Looking up what a component or setting does | [Components and configuration](#components-and-configuration) |
 | A developer creating roles for your workloads | [Developer guide](#developer-guide) |
 
@@ -38,7 +42,7 @@ request and, after merge and an approver's sign-off, applies the change.
 
 | Path | What it is | How it's applied |
 |---|---|---|
-| [`accounts/`](accounts/) | The main Terraform configuration: delegations, platform roles, GitHub OIDC provider and guardrails, fanned out to every account under the OU. | GitHub Actions on merge (or locally) |
+| [`accounts/`](accounts/) | The main Terraform configuration: account assignments, plus delegations, platform roles, GitHub OIDC provider and guardrails, fanned out to every account a delegation's permission set is assigned to. | GitHub Actions on merge (or locally) |
 | [`bootstrap/state-bucket/`](bootstrap/state-bucket/main.tf) | S3 bucket for the `accounts/` Terraform state. | Once, by hand (local state) |
 | [`bootstrap/github/`](bootstrap/github/setup.sh) | Script that sets up the GitHub repository and the AWS roles the workflow uses. Reusable for other organizations. | Once, by hand; re-run to repair or sync |
 | [`.github/`](.github/workflows/terraform.yml) | The plan/apply workflow and its helpers. | — |
@@ -54,10 +58,13 @@ Do these steps once per organization, in order.
 
 ### Prerequisites
 
-- An AWS Organization with IAM Identity Center, and the permission sets your
-  delegations will extend (for example `PowerUserAccess`).
+- An AWS Organization with IAM Identity Center, the permission sets your
+  delegations and assignments name (for example `PowerUserAccess`), and the
+  groups and users they name (for example synced from your IdP). Terraform
+  doesn't create permission sets, groups or users.
 - `OrganizationAccountAccessRole` (or another role, set as `execution_role_name`)
-  in every account under the OU, assumable from the management account.
+  in every account a delegation's permission set is assigned to, assumable from
+  the management account.
   Organizations creates it only in accounts it created; add it by hand to
   invited accounts.
 - Management-account AWS credentials.
@@ -93,12 +100,14 @@ aws organizations enable-policy-type \
 ```bash
 cd accounts
 cp backend.hcl.example backend.hcl                # state bucket + region
-cp terraform.tfvars.example terraform.tfvars      # ou_id, delegations, github_orgs, ...
+cp terraform.tfvars.example terraform.tfvars      # account_assignments, delegations, github_orgs, ...
 cd ..
 ```
 
-`delegations` and `github_orgs` are required; see
+`account_assignments`, `delegations` and `github_orgs` are required; see
 [Inputs](#inputs-accountsvariablestf) for the rest. Both files are git-ignored.
+If permission sets are already assigned by hand,
+[import them](#importing-existing-assignments) before the first apply.
 
 Before the first apply, list in `trusted_external_account_ids` every AWS
 account **outside** the organization that assumes roles in your accounts (for
@@ -181,7 +190,7 @@ Every change goes through a pull request to `main`:
 **The plan is not shown in the logs.** The repository is public, and so are its
 Actions logs. The jobs show only which resources change and how (for example
 `create terraform_data.platform_roles["platform-eks-node"]`). Account,
-organization, OU and Identity Center IDs are masked. To review the full diff,
+organization, OU and Identity Center IDs, and group and user names, are masked. To review the full diff,
 check out the branch and run `terraform plan` locally.
 
 The apply's safety check compares the list of resources and actions, not their
@@ -227,17 +236,78 @@ GH_ORG=<github-org> GH_REPO=<repo> bootstrap/github/setup.sh secrets
 - **Remove:** remove the entry. The apply deletes its policies in every
   account, except those still attached (see [Teardown](#teardown)).
 
+### Assigning permission sets
+
+Add, change or remove an entry in `account_assignments` in `terraform.tfvars`,
+update the secret, and open a pull request. Don't assign permission sets in
+the Identity Center console: Terraform doesn't see those assignments, and
+creating one that exists fails (see
+[Importing existing assignments](#importing-existing-assignments)).
+
+```hcl
+account_assignments = {
+  prod-poweruser = {
+    permission_set = "PowerUserAccess"
+    groups         = ["AWS Access Prod PU"]   # display name, exactly as in Identity Center
+    ous            = ["ou-abcd-22222222"]     # every ACTIVE account beneath it
+  }
+  dalgo-nonprod-admin = {
+    permission_set = "AdministratorAccess"
+    groups         = ["AWS Access NonProd Dalgo Administrator"]
+    users          = ["jane@example.org"]     # user name
+    accounts       = ["111122223333"]
+  }
+}
+```
+
+- Identity Center assigns per account, so an OU expands to its `ACTIVE`
+  accounts, including nested OUs.
+- **Assigning a delegation's permission set** (one listed in a delegation's
+  `permission_sets`) also covers that OU or account with everything the
+  delegation needs: its policies, the platform roles, the GitHub OIDC provider
+  and the [guardrails](#guardrails). Terraform creates those before the
+  assignment, because a permission set that references a missing delegation
+  policy fails to provision. The account needs the execution role.
+- Other permission sets (for example `ReadOnlyAccess`) are only assigned.
+- A delegation's permission set can't be assigned to the management account, or
+  to the root, which contains it. The plan fails if it is.
+- Removing an entry deletes its assignments. If that was an account's last
+  delegation assignment, the account also drops out of the fan-out (its
+  delegation policies are deleted; platform roles and the OIDC provider stay)
+  and its guardrail attachments are removed.
+- Groups and users must exist in Identity Center. Terraform looks them up by
+  name, and the plan fails if one is missing.
+
 ### Adding an account
 
-1. Create or move the account under the OU. Make sure it has the execution role.
-2. Run the workflow on `main` (**Actions → terraform (accounts) → Run
-   workflow**), then approve the apply. A new account changes no file, so a
-   merge alone doesn't pick it up.
-3. Assign the permission sets to the account afterwards. If you assigned them
-   first, [re-provision](#re-provisioning-a-permission-set) after the apply.
+1. Create or move the account into an assigned OU, or add it to an entry's
+   `accounts`. If it will get a delegation's permission set, make sure it has
+   the execution role.
+2. If you changed `terraform.tfvars`, update the secret and open a pull request.
+   Otherwise run the workflow on `main` (**Actions → terraform (accounts) → Run
+   workflow**), then approve the apply: a new account under an OU changes no
+   file, so nothing else picks it up.
 
 The apply re-runs every fan-out script in every account, because the account
 list is a trigger. This is safe; the scripts are idempotent.
+
+### Importing existing assignments
+
+Terraform won't adopt an assignment made by hand: creating it fails with
+"already exists". Import each one, locally, before the apply that would create
+it. Its address is in the plan (or the `account_assignments` output) and its ID
+is `<principal id>,<GROUP|USER>,<account id>,AWS_ACCOUNT,<permission set ARN>,<instance ARN>`:
+
+```bash
+cd accounts
+terraform import \
+  'aws_ssoadmin_account_assignment.this["PowerUserAccess/GROUP:Developers/111122223333"]' \
+  "<group id>,GROUP,111122223333,AWS_ACCOUNT,<permission set ARN>,<instance ARN>"
+```
+
+Group IDs: `aws identitystore list-groups --identity-store-id <id>`. Permission
+set and instance ARNs: `terraform output permission_set_arns`,
+`aws sso-admin list-instances`.
 
 ### Adding new org members to the team
 
@@ -297,7 +367,7 @@ terraform apply
 
 ### Teardown
 
-Run locally: `terraform destroy`. It detaches the delegation policies and any
+Run locally: `terraform destroy`. It deletes the account assignments, detaches the delegation policies and any
 permission-set boundaries from the permission sets, deletes the RCPs, then
 deletes each delegation's policies in every account, delegation policy first.
 A policy still attached somewhere is left in place with a warning: remove the
@@ -318,19 +388,23 @@ provider are never deleted automatically.
 | `aws_ssoadmin_permissions_boundary_attachment.delegation["<delegation>/<permission set>"]` | Only for delegations with `permission-set-boundary.json.tftpl`: sets it as the permission sets' boundary. |
 | `terraform_data.platform_roles["<role>"]` | Runs `scripts/apply-platform-roles.sh`: upserts the platform role in every account. |
 | `terraform_data.github_oidc` | Runs `scripts/apply-github-oidc.sh`: creates the GitHub Actions OIDC provider in every account. |
-| `aws_organizations_policy.github_oidc` + attachment | RCP `github-oidc-trusted-orgs` on the OU (see [Guardrails](#guardrails)). |
-| `aws_organizations_policy.sts_org_only` + attachment | RCP `sts-assumerole-org-only` on the OU (see [Guardrails](#guardrails)). |
+| `aws_organizations_policy.github_oidc` + attachments | RCP `github-oidc-trusted-orgs` (see [Guardrails](#guardrails)). |
+| `aws_organizations_policy.sts_org_only` + attachments | RCP `sts-assumerole-org-only` (see [Guardrails](#guardrails)). |
+| `aws_ssoadmin_account_assignment.this["<permission set>/<GROUP\|USER>:<name>/<account>"]` | One Identity Center assignment per permission set, principal and account (see [Assigning permission sets](#assigning-permission-sets)). |
+
+"Every account" above means every account a delegation's permission set is
+assigned to.
 
 Outputs: `target_account_ids`, `target_account_count`, `permission_set_arns`,
-`delegation_policies`.
+`delegation_policies`, `account_assignments`.
 
 ### Inputs (`accounts/variables.tf`)
 
 | Input | Default | Purpose |
 |---|---|---|
+| `account_assignments` | required | See [Assigning permission sets](#assigning-permission-sets). |
 | `delegations` | required | See [Delegations](#delegations). |
 | `github_orgs` | required | GitHub organizations allowed to use the GitHub OIDC provider. Case-sensitive. |
-| `ou_id` | whole org | OU (or root) whose `ACTIVE` accounts, including nested OUs, are covered. |
 | `execution_role_name` | `OrganizationAccountAccessRole` | Role the fan-out scripts assume in each account. |
 | `platform_roles` | the two EKS roles | See [Platform roles](#platform-roles). |
 | `trusted_external_account_ids` | none | Accounts outside the org that may still assume roles here. |
@@ -469,7 +543,8 @@ under the boundary, that trust this one. It is never deleted automatically.
 
 ### Guardrails
 
-Two resource control policies (RCPs) on the OU. RCPs never apply to the
+Two resource control policies (RCPs), attached to each OU and account a
+delegation's permission set is assigned to. RCPs never apply to the
 management account.
 
 - **`github-oidc-trusted-orgs`.** Users write their CI roles' trust policies,
@@ -582,6 +657,19 @@ repository can't match.
 - **Team members can use the plan role** by editing the workflow in a pull
   request. It is read-only, but can read the Terraform state, Organizations and
   Identity Center configuration, and the tfvars secret.
+
+### Migrating from `ou_id`
+
+Earlier versions covered one OU (`ou_id`) and left account assignments to you.
+Replace `ou_id` with `account_assignments` entries for every assignment you
+have today, [import them](#importing-existing-assignments), re-run the `aws`
+step of `bootstrap/github/setup.sh` (the CI roles need Identity Store reads and
+assignment permissions) and update the secret.
+
+The first apply replaces the RCP attachments on the OU with attachments on the
+new targets, and re-runs the fan-out scripts if the set of covered accounts
+changed. An account under the old OU that has no delegation permission set
+assigned drops out of the fan-out.
 
 ### Migrating from the single-permission-set layout
 

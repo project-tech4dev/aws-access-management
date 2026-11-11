@@ -297,14 +297,15 @@ step_aws() {
     }' "$@"
   }
 
-  # What `terraform plan` needs: Organizations / Identity Center reads, state
-  # read, and the S3 lock file.
+  # What `terraform plan` needs: Organizations / Identity Center reads (including
+  # group and user lookups), state read, and the S3 lock file.
   local plan_policy apply_policy
   plan_policy="$(jq -n --arg b "arn:aws:s3:::$bucket" --arg k "$STATE_KEY" '{
     Version: "2012-10-17",
     Statement: [
       { Sid: "ReadOrgAndIdentityCenter", Effect: "Allow", Resource: "*",
-        Action: ["organizations:Describe*", "organizations:List*", "sso:Describe*", "sso:Get*", "sso:List*"] },
+        Action: ["organizations:Describe*", "organizations:List*", "sso:Describe*", "sso:Get*", "sso:List*",
+                 "identitystore:Describe*", "identitystore:Get*", "identitystore:List*"] },
       { Sid: "StateList", Effect: "Allow", Action: "s3:ListBucket", Resource: $b },
       { Sid: "StateRead", Effect: "Allow", Action: "s3:GetObject", Resource: "\($b)/\($k)" },
       { Sid: "StateLock", Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
@@ -327,6 +328,8 @@ step_aws() {
                "sso:PutPermissionsBoundaryToPermissionSet",
                "sso:DeletePermissionsBoundaryFromPermissionSet",
                "sso:ProvisionPermissionSet"] },
+    { Sid: "ManageAccountAssignments", Effect: "Allow", Resource: "*",
+      Action: ["sso:CreateAccountAssignment", "sso:DeleteAccountAssignment"] },
     { Sid: "FanOutIntoMemberAccounts", Effect: "Allow", Action: "sts:AssumeRole",
       Resource: "arn:aws:iam::*:role/\($r)",
       Condition: { StringEquals: { "aws:ResourceOrgID": $o } } }
