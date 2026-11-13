@@ -7,7 +7,8 @@ name: terraform (accounts)
 # Set up by bootstrap/github/setup.sh:
 #   Secrets (repository):  AWS_PLAN_ROLE_ARN, TF_STATE_BUCKET, TFVARS_BASE64
 #   Secret (environment "production"): AWS_APPLY_ROLE_ARN
-#   Variable (repository): AWS_REGION
+#   Variables (repository): AWS_REGION, TF_ACCOUNT_ASSIGNMENTS, TF_DELEGATIONS
+#     (editing a variable doesn't start a run: run the workflow on main by hand)
 #
 # The repository may be public, and so are its Actions logs. Values come from
 # secrets (masked), account/org/OU/SSO IDs are masked, and the logs show only
@@ -64,6 +65,8 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
+          account-assignments: ${{ vars.TF_ACCOUNT_ASSIGNMENTS }}
+          delegations: ${{ vars.TF_DELEGATIONS }}
           terraform-version: ${{ env.TF_VERSION }}
 
       - name: Format
@@ -90,6 +93,8 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
+          account-assignments: ${{ vars.TF_ACCOUNT_ASSIGNMENTS }}
+          delegations: ${{ vars.TF_DELEGATIONS }}
           terraform-version: ${{ env.TF_VERSION }}
 
       - name: Plan
@@ -110,6 +115,8 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
+          account-assignments: ${{ vars.TF_ACCOUNT_ASSIGNMENTS }}
+          delegations: ${{ vars.TF_DELEGATIONS }}
           terraform-version: ${{ env.TF_VERSION }}
 
       - name: Plan

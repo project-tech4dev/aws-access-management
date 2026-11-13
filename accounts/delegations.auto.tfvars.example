@@ -1,0 +1,22 @@
+# delegations: in CI, the TF_DELEGATIONS repository variable (Settings >
+# Secrets and variables > Actions > Variables). That copy is the one that
+# counts; refresh this local file with
+#   gh variable get TF_DELEGATIONS --repo <org>/<repo> > delegations.auto.tfvars
+#
+# Delegations: who may create IAM roles, under which prefix and boundary.
+# Each key is a directory under policies/delegations/<key>/ holding
+# delegation.json.tftpl and role-boundary.json.tftpl (and optionally
+# permission-set-boundary.json.tftpl). See the README.
+delegations = {
+  poweruser = {
+    permission_sets        = ["PowerUserAccess"]
+    prefix                 = "app"
+    role_boundary_name     = "PowerUserRoleBoundary"
+    delegation_policy_name = "poweruser-iam-delegation"
+    pass_to_services       = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com", "pods.eks.amazonaws.com", "events.amazonaws.com", "scheduler.amazonaws.com"]
+    platform_roles = {
+      platform-eks-cluster = ["eks.amazonaws.com"]
+      platform-eks-node    = ["eks.amazonaws.com"]
+    }
+  }
+}

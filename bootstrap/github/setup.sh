@@ -40,6 +40,9 @@
 #   environment  APPLY_ENVIRONMENT: an approver must approve; main only
 #   variables    the settings above as Actions variables
 #   secrets      role ARNs, state bucket and tfvars (base64) as Actions secrets
+#   access       TF_ACCOUNT_ASSIGNMENTS and TF_DELEGATIONS variables from
+#                accounts/*.auto.tfvars, only those that don't exist yet
+#                (they are edited in GitHub afterwards)
 #   rulesets     main: PR + passing "plan" check for everyone; code-owner
 #                (an approver) review, bypassable via PR by GH_APPROVER_TEAM
 #
@@ -408,6 +411,27 @@ step_secrets() {
 }
 
 # ---------------------------------------------------------------------------
+# account_assignments and delegations are edited in GitHub (repository
+# variables), so this only creates a variable that is missing and never
+# overwrites edits made there.
+step_access() {
+  say "access"
+  local name file
+  for name in account_assignments delegations; do
+    local var="TF_$(tr '[:lower:]' '[:upper:]' <<< "$name")"
+    file="$ROOT/accounts/$name.auto.tfvars"
+    if gh variable get "$var" --repo "$REPO" >/dev/null 2>&1; then
+      echo "$var exists; edit it in GitHub, or replace it with:"
+      echo "  gh variable set $var --repo $REPO < $file"
+      continue
+    fi
+    [ -f "$file" ] || die "$file not found (copy $name.auto.tfvars.example)"
+    gh variable set "$var" --repo "$REPO" < "$file"
+    echo "created $var"
+  done
+}
+
+# ---------------------------------------------------------------------------
 upsert_ruleset() {
   # stdin = ruleset JSON (with .name)
   local body name id
@@ -466,7 +490,7 @@ step_rulesets() {
 }
 
 # ---------------------------------------------------------------------------
-ALL_STEPS=(preflight repo teams actions code aws environment variables secrets rulesets)
+ALL_STEPS=(preflight repo teams actions code aws environment variables secrets access rulesets)
 STEPS=("$@")
 [ "${#STEPS[@]}" -gt 0 ] || STEPS=("${ALL_STEPS[@]}")
 for s in "${STEPS[@]}"; do
