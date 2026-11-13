@@ -1,7 +1,8 @@
 name: terraform-setup
 description: >
   Install Terraform, assume an AWS role via OIDC, mask organization identifiers
-  in the logs, write terraform.tfvars and run terraform init (in accounts/).
+  in the logs, write terraform.tfvars and the *.auto.tfvars files, and run
+  terraform init (in accounts/).
 
 inputs:
   role-to-assume:
@@ -11,7 +12,13 @@ inputs:
   state-bucket:
     required: true
   tfvars:
-    description: Base64-encoded contents of accounts/terraform.tfvars.
+    description: Base64-encoded contents of accounts/terraform.tfvars (everything except account_assignments and delegations).
+    required: true
+  account-assignments:
+    description: The account_assignments block (HCL), from the TF_ACCOUNT_ASSIGNMENTS repository variable.
+    required: true
+  delegations:
+    description: The delegations block (HCL), from the TF_DELEGATIONS repository variable.
     required: true
   terraform-version:
     required: true
@@ -36,6 +43,37 @@ runs:
       env:
         TFVARS: ${{ inputs.tfvars }}
       run: printf '%s' "$TFVARS" | base64 -d > terraform.tfvars
+
+    # account_assignments and delegations are repository variables, so they can
+    # be read and edited in GitHub; neither is committed, as the repository may
+    # be public. Terraform loads *.auto.tfvars automatically.
+    - name: Write account_assignments.auto.tfvars and delegations.auto.tfvars
+      shell: bash
+      working-directory: accounts
+      env:
+        TF_ACCOUNT_ASSIGNMENTS: ${{ inputs.account-assignments }}
+        TF_DELEGATIONS: ${{ inputs.delegations }}
+      run: |
+        set -euo pipefail
+        write() { # $1 = Terraform variable, $2 = repository variable
+          local value="${!2}" other
+          if [ -z "$value" ]; then
+            echo "::error::The $2 repository variable is empty or missing (see README, Changing access)."
+            exit 1
+          fi
+          printf '%s\n' "$value" > "$1.auto.tfvars"
+          # Each may set only its own variable, or it would override another.
+          if other="$(grep -E '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*=' "$1.auto.tfvars" | grep -vE "^$1[[:space:]]*=")"; then
+            echo "::error::$2 may only set $1, but it also sets: ${other%%=*}"
+            exit 1
+          fi
+          if grep -qE "^$1[[:space:]]*=" terraform.tfvars; then
+            echo "::error::The TFVARS_BASE64 secret also sets $1. Remove it from the secret; it comes from $2."
+            exit 1
+          fi
+        }
+        write account_assignments TF_ACCOUNT_ASSIGNMENTS
+        write delegations TF_DELEGATIONS
 
     # Logs of a public repository are public. Mask every identifier of the
     # organization that Terraform or the fan-out scripts might print.
@@ -63,6 +101,20 @@ runs:
             mask "${ps##*/}"
           done
         done
+
+    # Delegations hold nothing sensitive: show them, so a run isn't blind. The
+    # assignments are left out (their IDs and group names are masked anyway).
+    - name: Show delegations
+      shell: bash
+      working-directory: accounts
+      run: |
+        cat delegations.auto.tfvars
+        {
+          echo "### Delegations (\`TF_DELEGATIONS\`)"
+          echo '```hcl'
+          cat delegations.auto.tfvars
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Init
       shell: bash
