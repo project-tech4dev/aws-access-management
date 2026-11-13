@@ -26,7 +26,8 @@
 #   ROLE_NAME_PREFIX     IAM roles <prefix>-plan and -apply (default github-<repo>)
 #
 # Not stored: STATE_BUCKET (default: bootstrap/state-bucket output, stored as a
-# secret), TFVARS_FILE (default accounts/terraform.tfvars), COMMIT_MESSAGE.
+# secret), TFVARS_FILE (default accounts/terraform.tfvars), OVERWRITE_ACCESS,
+# COMMIT_MESSAGE.
 #
 # With no steps, runs all of them in this order:
 #
@@ -40,9 +41,9 @@
 #   environment  APPLY_ENVIRONMENT: an approver must approve; main only
 #   variables    the settings above as Actions variables
 #   secrets      role ARNs, state bucket and tfvars (base64) as Actions secrets
-#   access       TF_ACCOUNT_ASSIGNMENTS and TF_DELEGATIONS variables from
-#                accounts/*.auto.tfvars, only those that don't exist yet
-#                (they are edited in GitHub afterwards)
+#   access       TF_ACCOUNT_ASSIGNMENTS and TF_DELEGATIONS variables from the
+#                account_assignments and delegations blocks in TFVARS_FILE;
+#                one edited in GitHub is replaced only with OVERWRITE_ACCESS=1
 #   rulesets     main: PR + passing "plan" check for everyone; code-owner
 #                (an approver) review, bypassable via PR by GH_APPROVER_TEAM
 #
@@ -404,30 +405,61 @@ step_secrets() {
   gh secret set TF_STATE_BUCKET --repo "$REPO" --body "$(state_bucket)"
   # Base64, so the secret is one line: GitHub masks multi-line secrets line by
   # line, which would also mask unrelated text such as a lone "}".
-  base64 < "$ROOT/$TFVARS_FILE" | tr -d '\n' | gh secret set TFVARS_BASE64 --repo "$REPO"
+  # Without account_assignments and delegations: those are the TF_* variables
+  # (the `access` step), and CI rejects a secret that sets them.
+  tfvars_without_access "$ROOT/$TFVARS_FILE" | base64 | tr -d '\n' \
+    | gh secret set TFVARS_BASE64 --repo "$REPO"
   gh secret set AWS_APPLY_ROLE_ARN --repo "$REPO" --env "$APPLY_ENVIRONMENT" \
     --body "arn:aws:iam::${account}:role/${ROLE_NAME_PREFIX}-apply"
   echo "ok"
 }
 
 # ---------------------------------------------------------------------------
-# account_assignments and delegations are edited in GitHub (repository
-# variables), so this only creates a variable that is missing and never
-# overwrites edits made there.
+# account_assignments and delegations live in the one local terraform.tfvars,
+# but CI reads them from repository variables (TF_ACCOUNT_ASSIGNMENTS,
+# TF_DELEGATIONS) so they can be read and edited in GitHub. These helpers cut
+# a top-level `name = { ... }` block out of a tfvars file by counting braces.
+ACCESS_BLOCKS=(account_assignments delegations)
+
+tfvars_block() { # $1 = name, $2 = file: print the block
+  awk -v n="$1" '
+    !inb && $0 ~ ("^" n "[ \t]*=") { inb = 1; d = 0 }
+    inb { print; t = $0; d += gsub(/[{]/, "", t); t = $0; d -= gsub(/[}]/, "", t); if (d <= 0) exit }
+  ' "$2"
+}
+
+tfvars_without_access() { # $1 = file: print everything except the blocks
+  awk '
+    !skip && $0 ~ /^(account_assignments|delegations)[ \t]*=/ { skip = 1; d = 0 }
+    skip { t = $0; d += gsub(/[{]/, "", t); t = $0; d -= gsub(/[}]/, "", t); if (d <= 0) skip = 0; next }
+    { print }
+  ' "$1"
+}
+
+# Sets each variable from its block in TFVARS_FILE. A variable that differs
+# from the file may have been edited in GitHub: show the difference and replace
+# it only with OVERWRITE_ACCESS=1.
 step_access() {
   say "access"
-  local name file
-  for name in account_assignments delegations; do
-    local var="TF_$(tr '[:lower:]' '[:upper:]' <<< "$name")"
-    file="$ROOT/accounts/$name.auto.tfvars"
-    if gh variable get "$var" --repo "$REPO" >/dev/null 2>&1; then
-      echo "$var exists; edit it in GitHub, or replace it with:"
-      echo "  gh variable set $var --repo $REPO < $file"
-      continue
+  local name var file="$ROOT/$TFVARS_FILE" local_value current
+  for name in "${ACCESS_BLOCKS[@]}"; do
+    var="TF_$(tr '[:lower:]' '[:upper:]' <<< "$name")"
+    local_value="$(tfvars_block "$name" "$file")"
+    [ -n "$local_value" ] || die "$name not found in $file"
+    if current="$(gh variable get "$var" --repo "$REPO" 2>/dev/null)"; then
+      if [ "$current" = "$local_value" ]; then
+        echo "$var is up to date"
+        continue
+      fi
+      echo "$var differs from $file (- GitHub, + local):"
+      diff <(printf '%s\n' "$current") <(printf '%s\n' "$local_value") || true
+      if [ "${OVERWRITE_ACCESS:-}" != 1 ]; then
+        echo "kept the GitHub value; re-run with OVERWRITE_ACCESS=1 to replace it, or copy it into $file"
+        continue
+      fi
     fi
-    [ -f "$file" ] || die "$file not found (copy $name.auto.tfvars.example)"
-    gh variable set "$var" --repo "$REPO" < "$file"
-    echo "created $var"
+    printf '%s\n' "$local_value" | gh variable set "$var" --repo "$REPO"
+    echo "set $var"
   done
 }
 

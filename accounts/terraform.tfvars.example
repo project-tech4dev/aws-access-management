@@ -2,15 +2,49 @@
 
 region = "us-east-1"
 
-# account_assignments and delegations are in account_assignments.auto.tfvars
-# and delegations.auto.tfvars (in CI: the TF_ACCOUNT_ASSIGNMENTS and
-# TF_DELEGATIONS repository variables). Don't set them here.
+# Who gets which permission set where, keyed by any name. An OU covers every
+# ACTIVE account beneath it (accounts added later are assigned on the next
+# apply). Groups and users must already exist in Identity Center.
+#
+# Every OU and account a delegation's permission set (here PowerUserAccess) is
+# assigned to also gets the delegation policies, platform roles, GitHub OIDC
+# provider and RCPs. Never assign those to the management account.
+account_assignments = {
+  nonprod-poweruser = {
+    permission_set = "PowerUserAccess"
+    groups         = ["Developers"]
+    ous            = ["ou-abcd-11111111"]
+  }
+  billing-readonly = {
+    permission_set = "ReadOnlyAccess"
+    groups         = ["Finance"]
+    users          = ["jane@example.org"]
+    accounts       = ["111122223333"]
+  }
+}
 
 # Role the fan-out script assumes in each account a delegation's permission set
 # is assigned to. Must already exist there and be assumable by the credentials
 # Terraform runs as.
 execution_role_name = "OrganizationAccountAccessRole"
 
+# Delegations: who may create IAM roles, under which prefix and boundary.
+# Each key is a directory under policies/delegations/<key>/ holding
+# delegation.json.tftpl and role-boundary.json.tftpl (and optionally
+# permission-set-boundary.json.tftpl). See the README.
+delegations = {
+  poweruser = {
+    permission_sets        = ["PowerUserAccess"]
+    prefix                 = "app"
+    role_boundary_name     = "PowerUserRoleBoundary"
+    delegation_policy_name = "poweruser-iam-delegation"
+    pass_to_services       = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com", "pods.eks.amazonaws.com", "events.amazonaws.com", "scheduler.amazonaws.com"]
+    platform_roles = {
+      platform-eks-cluster = ["eks.amazonaws.com"]
+      platform-eks-node    = ["eks.amazonaws.com"]
+    }
+  }
+}
 
 # Platform roles (no boundary) created in every account. The default is the two
 # EKS roles above; override to add more. Names must not start with any prefix.

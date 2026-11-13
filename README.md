@@ -100,20 +100,19 @@ aws organizations enable-policy-type \
 ```bash
 cd accounts
 cp backend.hcl.example backend.hcl                # state bucket + region
-cp terraform.tfvars.example terraform.tfvars      # github_orgs, ...
-cp account_assignments.auto.tfvars.example account_assignments.auto.tfvars
-cp delegations.auto.tfvars.example delegations.auto.tfvars
+cp terraform.tfvars.example terraform.tfvars      # account_assignments, delegations, github_orgs, ...
 cd ..
 ```
 
 `account_assignments`, `delegations` and `github_orgs` are required; see
-[Inputs](#inputs-accountsvariablestf) for the rest. All four files are
-git-ignored, so the repository can be public. Terraform loads `*.auto.tfvars`
-automatically. In CI, `terraform.tfvars` comes from the `TFVARS_BASE64` secret,
-and the two `*.auto.tfvars` files come from the `TF_ACCOUNT_ASSIGNMENTS` and
-`TF_DELEGATIONS` repository variables, which you can read and edit in GitHub
-(see [Changing access](#changing-access)). The `access` step of the setup
-script creates those variables from your local files.
+[Inputs](#inputs-accountsvariablestf) for the rest. Both files are git-ignored,
+so the repository can be public.
+
+CI splits `terraform.tfvars` in two. The `account_assignments` and
+`delegations` blocks become the `TF_ACCOUNT_ASSIGNMENTS` and `TF_DELEGATIONS`
+repository variables, which you can read and edit in GitHub (see
+[Changing access](#changing-access)). The rest becomes the `TFVARS_BASE64`
+secret. The `access` and `secrets` steps of the setup script do the split.
 If permission sets are already assigned by hand,
 [import them](#importing-existing-assignments) before the first apply.
 
@@ -226,17 +225,20 @@ takes effect without re-provisioning.
 
 ### Changing access
 
-`account_assignments` and `delegations` are repository variables, not secrets,
-so you can read them in GitHub as well as edit them:
-**Settings → Secrets and variables → Actions → Variables**.
+In CI, `account_assignments` and `delegations` come from repository variables,
+not secrets, so you can read them in GitHub as well as edit them:
+**Settings → Secrets and variables → Actions → Variables**. Locally they stay
+in `accounts/terraform.tfvars`.
 
-| Variable | Holds | Written to |
+| Variable | Holds | Written to (in CI) |
 |---|---|---|
 | `TF_ACCOUNT_ASSIGNMENTS` | The whole `account_assignments = { … }` block, in HCL | `accounts/account_assignments.auto.tfvars` |
 | `TF_DELEGATIONS` | The whole `delegations = { … }` block, in HCL | `accounts/delegations.auto.tfvars` |
 
-1. Edit the variable. Each may set only its own block; the run fails if it sets
-   anything else, or if the `TFVARS_BASE64` secret also sets that block.
+1. Edit the block in `accounts/terraform.tfvars` and run
+   `bootstrap/github/setup.sh access`, or edit the variable in GitHub. Each
+   variable may set only its own block; the run fails if it sets anything else,
+   or if the `TFVARS_BASE64` secret also sets that block.
 2. Editing a variable doesn't start a run. Run the workflow on `main` by hand
    (**Actions → terraform (accounts) → Run workflow**), check the plan, then
    approve the apply. Each run prints the delegations in its log and job
@@ -246,18 +248,20 @@ An edit has no review and no history, and it takes effect on the next run.
 Copy the old value before you change it. Variables are not secrets: anyone who
 can run a modified workflow in the repository can print them.
 
-To run Terraform locally, refresh your copies first:
+Keep your local file and the variables the same. `setup.sh access` sets each
+variable from its block in the file. If a variable differs, for example after
+an edit in GitHub, it shows the difference and keeps the GitHub value. Copy that
+value into your file, or re-run with `OVERWRITE_ACCESS=1` to replace it:
 
 ```bash
-gh variable get TF_ACCOUNT_ASSIGNMENTS --repo <github-org>/<repo> > accounts/account_assignments.auto.tfvars
-gh variable get TF_DELEGATIONS --repo <github-org>/<repo> > accounts/delegations.auto.tfvars
+GH_ORG=<github-org> GH_REPO=<repo> bootstrap/github/setup.sh access
 ```
 
 ### Changing `terraform.tfvars`
 
 The workflow reads `accounts/terraform.tfvars` (everything except
-`account_assignments` and `delegations`) from the `TFVARS_BASE64` secret, not
-from the repository. After changing the file locally, update the secret
+`account_assignments` and `delegations`, which the `secrets` step leaves out)
+from the `TFVARS_BASE64` secret, not from the repository. After changing the file locally, update the secret
 and then open a pull request (any change under `accounts/` will do, or run the
 workflow on `main` by hand):
 
@@ -621,7 +625,7 @@ ones named. Each is idempotent:
 | `environment` | `production`: an approver must approve; `main` only; admins can't bypass. |
 | `variables` | Stores the settings below as repository Actions variables. |
 | `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
-| `access` | Creates `TF_ACCOUNT_ASSIGNMENTS` and `TF_DELEGATIONS` from `accounts/*.auto.tfvars`, only those that don't exist yet; afterwards they are edited in GitHub. |
+| `access` | Sets `TF_ACCOUNT_ASSIGNMENTS` and `TF_DELEGATIONS` from the `account_assignments` and `delegations` blocks of `terraform.tfvars`. A variable that differs (edited in GitHub) is replaced only with `OVERWRITE_ACCESS=1`. |
 | `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
 
 **Settings** are read, in order of priority, from environment variables,
@@ -682,7 +686,7 @@ repository can't match.
 | `scripts/apply-policies.sh`, `destroy-policies.sh` | Upsert / best-effort delete of one delegation's policies. |
 | `scripts/apply-platform-roles.sh` | Upsert one platform role. |
 | `scripts/apply-github-oidc.sh` | Create the GitHub OIDC provider. |
-| `backend.hcl.example`, `terraform.tfvars.example`, `account_assignments.auto.tfvars.example`, `delegations.auto.tfvars.example` | Copy, fill in, keep out of git. |
+| `backend.hcl.example`, `terraform.tfvars.example` | Copy, fill in, keep out of git. |
 | `.terraform.lock.hcl` | Provider lock file. Commit it. |
 
 ### Known limitations
@@ -699,13 +703,12 @@ repository can't match.
   request. It is read-only, but can read the Terraform state, Organizations and
   Identity Center configuration, and the tfvars secret.
 
-### Moving `account_assignments` and `delegations` out of `terraform.tfvars`
+### Moving `account_assignments` and `delegations` out of the secret
 
-Earlier versions kept them in `terraform.tfvars`. Move each block into its own
-file (`accounts/account_assignments.auto.tfvars`,
-`accounts/delegations.auto.tfvars`), run the `access` and `secrets` steps of the
-setup script, then run the workflow. It stops while the secret still sets
-either block.
+Earlier versions sent them to CI inside the `TFVARS_BASE64` secret. Keep them
+in `terraform.tfvars`, run the `access` and `secrets` steps of the setup
+script, then run the workflow. It stops while the secret still sets either
+block.
 
 ### Migrating from `ou_id`
 
@@ -725,7 +728,7 @@ assigned drops out of the fan-out.
 Earlier versions took `permission_set_name`, `prefix`, `boundary_policy_name`,
 `delegation_policy_name`, `eks_cluster_role_name` and `eks_node_role_name`.
 Replace them with a `poweruser` entry in `delegations` that uses the same names
-(as in `delegations.auto.tfvars.example`), and update the `TF_DELEGATIONS` variable.
+(as in `terraform.tfvars.example`), and run the `access` step of the setup script.
 
 `moved` blocks in `main.tf` map the old resources to the `poweruser` delegation
 and the `PowerUserAccess` permission set; edit the second one if your
