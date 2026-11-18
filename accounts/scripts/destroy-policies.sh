@@ -1,20 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Best-effort teardown of one delegation's customer-managed policies in every
-# target account. Invoked by Terraform as the destroy-time provisioner on
-# terraform_data.delegated_iam_policies["<delegation>"] (and runnable by hand).
-#
-# Inputs (environment), in addition to those in lib.sh:
-#   POLICY_NAMES  JSON array of policy names, in creation order. They are
-#                 deleted in reverse order (delegation policy before boundaries).
-#
-# A policy that is still attached to an entity (an Identity Center role that
-# still references it, or a role that uses it as a permissions boundary) is
-# LEFT IN PLACE with a warning - that is not treated as a failure. Remove the
-# reference from the permission set and re-provision it, then re-run to delete
-# the leftovers. A genuine error (role not assumable, delete API failure) exits
-# non-zero so Terraform retries.
-# ---------------------------------------------------------------------------
+# Delete one delegation's policies (POLICY_NAMES) in every target account.
+# Destroy provisioner of terraform_data.delegated_iam_policies; see README, "Teardown".
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 : "${POLICY_NAMES:?}"

@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Create the GitHub Actions IAM OIDC provider in every target account by
-# assuming a role in each account. Invoked by Terraform
-# (terraform_data.github_oidc).
-#
-# End users can't create OIDC providers. Once this exists they create their own
-# prefixed, boundary-capped CI roles that trust it. Which GitHub repos can use
-# those roles is enforced by the RCP (aws_organizations_policy.github_oidc),
-# not here.
-#
-# Inputs (environment): those in lib.sh.
-#
-# Idempotent: an existing provider (e.g. one created by hand) is kept, and the
-# sts.amazonaws.com audience is added to it if missing. Never deletes.
-# ---------------------------------------------------------------------------
+# Create the GitHub Actions OIDC provider in every target account.
+# Run by terraform_data.github_oidc; see README, "How the fan-out works".
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 PROVIDER_HOST="token.actions.githubusercontent.com"

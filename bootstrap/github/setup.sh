@@ -1,53 +1,7 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Set up the GitHub repository and the AWS access its Terraform workflow uses.
-# Every step is idempotent; re-run it to repair drift or to add new org
-# members to the team.
-#
-#   GH_ORG=<org> GH_REPO=<repo> [SETTING=value ...] bootstrap/github/setup.sh [step ...]
-#
-# Settings come from environment variables. The `variables` step stores them
-# as Actions variables on the repository, and later runs read any setting not
-# set in the environment from there, so only GH_ORG and GH_REPO are needed:
-#
-#   GH_ORG               GitHub organization (required)
-#   GH_REPO              repository name (required)
-#   GH_APPROVER          comma-separated users who approve PRs and applies
-#                        (required on first run); any one approval is enough
-#   GH_VISIBILITY        public | private (default public; private needs a paid
-#                        GitHub plan for the approval gates)
-#   GH_TEAM              team of org members with Write (default <repo>)
-#   GH_APPROVER_TEAM     team of just the approvers, may bypass review via PR
-#                        (default <repo>-approvers)
-#   APPLY_ENVIRONMENT    environment the apply runs in (default production)
-#   AWS_REGION           default us-east-1
-#   STATE_KEY            must match accounts/versions.tf (default permissions/terraform.tfstate)
-#   EXECUTION_ROLE_NAME  role the fan-out assumes (default OrganizationAccountAccessRole)
-#   ROLE_NAME_PREFIX     IAM roles <prefix>-plan and -apply (default github-<repo>)
-#
-# Not stored: STATE_BUCKET (default: bootstrap/state-bucket output, stored as a
-# secret), TFVARS_FILE (default accounts/terraform.tfvars), COMMIT_MESSAGE.
-#
-# With no steps, runs all of them in this order:
-#
-#   preflight    check tools, logins and that AWS is the management account
-#   repo         create the repository (if missing) and set merge options
-#   teams        GH_TEAM = org members except owners (Write);
-#                GH_APPROVER_TEAM = only the approvers (Write, ruleset bypass)
-#   actions      read-only GITHUB_TOKEN; approval for all fork PR workflows
-#   code         write .github/CODEOWNERS; first push to an empty repo
-#   aws          GitHub OIDC provider + plan/apply IAM roles in this account
-#   environment  APPLY_ENVIRONMENT: an approver must approve; main only
-#   variables    the settings above as Actions variables
-#   secrets      role ARNs, state bucket and tfvars (base64) as Actions secrets
-#   rulesets     main: PR + passing "plan" check for everyone; code-owner
-#                (an approver) review, bypassable via PR by GH_APPROVER_TEAM
-#
-# Requirements: gh (logged in with scopes repo, workflow, admin:org; an org
-# owner, or a member allowed to create repositories and teams), aws
-# (management-account credentials), jq, git, terraform (only to read the state
-# bucket name when STATE_BUCKET is unset).
-# ---------------------------------------------------------------------------
+# Set up the GitHub repository and its AWS access. Idempotent.
+#   GH_ORG=<org> GH_REPO=<repo> bootstrap/github/setup.sh [step ...]
+# Steps, settings and requirements: README, "GitHub repository and workflow".
 set -euo pipefail
 
 say() { printf '\n== %s\n' "$*"; }
@@ -126,9 +80,7 @@ step_preflight() {
   for t in repo workflow admin:org; do
     [[ ", $scopes," == *", $t,"* ]] || die "gh token lacks scope '$t': gh auth refresh -h github.com -s admin:org,workflow"
   done
-  # Org owners can do everything here. A member works too if the org lets
-  # members create repositories and teams (the creator becomes repo admin and
-  # team maintainer); otherwise the repo or teams step fails with GitHub's error.
+  # A member works if the org lets members create repositories and teams.
   if [ "$(gh api "user/memberships/orgs/$GH_ORG" --jq .role)" != admin ]; then
     echo "note: $(gh api user --jq .login) is a member, not an owner, of $GH_ORG"
   fi
@@ -171,9 +123,7 @@ step_teams() {
   say "teams"
   local user
 
-  # Org owners already have admin access to every repository, so they are left
-  # out. Existing members are skipped: re-adding one would reset their role
-  # (and demote the creator, who is the team's maintainer, to member).
+  # Owners left out; existing members skipped (re-adding resets their role).
   ensure_team "$GH_TEAM" "Org members who can open PRs on $GH_REPO"
   while IFS= read -r user; do
     if gh api -X PUT "orgs/$GH_ORG/teams/$GH_TEAM/memberships/$user" -f role=member >/dev/null 2>&1; then
@@ -188,8 +138,7 @@ step_teams() {
       <(gh api --paginate "orgs/$GH_ORG/teams/$GH_TEAM/members" --jq '.[].login' | sort))
   echo "ok: $GH_TEAM has $(gh api --paginate "orgs/$GH_ORG/teams/$GH_TEAM/members" --jq '.[].login' | wc -l | tr -d ' ') members (org owners need no team)"
 
-  # Creating a team adds the creator as a maintainer; this team must hold only
-  # the approver, because it may bypass the review ruleset.
+  # Only the approvers: this team may bypass review.
   ensure_team "$GH_APPROVER_TEAM" "May merge their own PRs on $GH_REPO (via PR only)"
   for t in "${APPROVERS[@]}"; do
     if ! gh api "orgs/$GH_ORG/teams/$GH_APPROVER_TEAM/memberships/$t" >/dev/null 2>&1; then
@@ -259,9 +208,7 @@ step_aws() {
   local account org_id sub_prefix bucket provider_arn
   account="$(aws sts get-caller-identity --query Account --output text)"
   org_id="$(aws organizations describe-organization --query Organization.Id --output text)"
-  # The `sub` claim's repository part, exactly as GitHub issues it. Newer repos
-  # use immutable subjects ("repo:org@<id>/repo@<id>"), which a renamed or
-  # re-created repository can't match; older ones use "repo:org/repo".
+  # The `sub` claim's repository part, exactly as GitHub issues it.
   sub_prefix="$(gh api "repos/$REPO/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty' 2>/dev/null || true)"
   [ -n "$sub_prefix" ] || sub_prefix="repo:$(gh api "repos/$REPO" --jq .full_name)"
   echo "OIDC subject prefix: $sub_prefix"
@@ -394,17 +341,60 @@ step_secrets() {
   say "secrets"
   local account
   account="$(aws sts get-caller-identity --query Account --output text)"
-  # Secrets, not variables: GitHub masks secrets in logs, and logs of a public
-  # repository are public.
+  # Secrets, not variables: GitHub masks secrets in (public) logs.
   gh secret set AWS_PLAN_ROLE_ARN --repo "$REPO" \
     --body "arn:aws:iam::${account}:role/${ROLE_NAME_PREFIX}-plan"
   gh secret set TF_STATE_BUCKET --repo "$REPO" --body "$(state_bucket)"
-  # Base64, so the secret is one line: GitHub masks multi-line secrets line by
-  # line, which would also mask unrelated text such as a lone "}".
-  base64 < "$ROOT/$TFVARS_FILE" | tr -d '\n' | gh secret set TFVARS_BASE64 --repo "$REPO"
+  # One line (base64), without the access blocks (those are the TF_* variables).
+  tfvars_without_access "$ROOT/$TFVARS_FILE" | base64 | tr -d '\n' \
+    | gh secret set TFVARS_BASE64 --repo "$REPO"
   gh secret set AWS_APPLY_ROLE_ARN --repo "$REPO" --env "$APPLY_ENVIRONMENT" \
     --body "arn:aws:iam::${account}:role/${ROLE_NAME_PREFIX}-apply"
   echo "ok"
+}
+
+# ---------------------------------------------------------------------------
+# Cut a top-level `name = { ... }` block out of a tfvars file by counting braces.
+ACCESS_BLOCKS=(account_assignments delegations)
+
+tfvars_block() { # $1 = name, $2 = file: print the block
+  awk -v n="$1" '
+    !inb && $0 ~ ("^" n "[ \t]*=") { inb = 1; d = 0 }
+    inb { print; t = $0; d += gsub(/[{]/, "", t); t = $0; d -= gsub(/[}]/, "", t); if (d <= 0) exit }
+  ' "$2"
+}
+
+tfvars_without_access() { # $1 = file: print everything except the blocks
+  awk '
+    !skip && $0 ~ /^(account_assignments|delegations)[ \t]*=/ { skip = 1; d = 0 }
+    skip { t = $0; d += gsub(/[{]/, "", t); t = $0; d -= gsub(/[}]/, "", t); if (d <= 0) skip = 0; next }
+    { print }
+  ' "$1"
+}
+
+# Set TF_* from TFVARS_FILE; keep a value edited in GitHub unless OVERWRITE_ACCESS=1.
+step_access() {
+  say "access"
+  local name var file="$ROOT/$TFVARS_FILE" local_value current
+  for name in "${ACCESS_BLOCKS[@]}"; do
+    var="TF_$(tr '[:lower:]' '[:upper:]' <<< "$name")"
+    local_value="$(tfvars_block "$name" "$file")"
+    [ -n "$local_value" ] || die "$name not found in $file"
+    if current="$(gh variable get "$var" --repo "$REPO" 2>/dev/null)"; then
+      if [ "$current" = "$local_value" ]; then
+        echo "$var is up to date"
+        continue
+      fi
+      echo "$var differs from $file (- GitHub, + local):"
+      diff <(printf '%s\n' "$current") <(printf '%s\n' "$local_value") || true
+      if [ "${OVERWRITE_ACCESS:-}" != 1 ]; then
+        echo "kept the GitHub value; re-run with OVERWRITE_ACCESS=1 to replace it, or copy it into $file"
+        continue
+      fi
+    fi
+    printf '%s\n' "$local_value" | gh variable set "$var" --repo "$REPO"
+    echo "set $var"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -448,8 +438,7 @@ step_rulesets() {
     ]
   }' | upsert_ruleset
 
-  # The approver's review. GitHub won't let them approve their own PR, so their
-  # team may bypass this ruleset - only when merging a PR, never by pushing.
+  # Approver review; their team may bypass it only when merging a PR.
   jq -n --argjson team "$team_id" '{
     name: "main: approver review",
     target: "branch",
@@ -466,7 +455,7 @@ step_rulesets() {
 }
 
 # ---------------------------------------------------------------------------
-ALL_STEPS=(preflight repo teams actions code aws environment variables secrets rulesets)
+ALL_STEPS=(preflight repo teams actions code aws environment variables secrets access rulesets)
 STEPS=("$@")
 [ "${#STEPS[@]}" -gt 0 ] || STEPS=("${ALL_STEPS[@]}")
 for s in "${STEPS[@]}"; do

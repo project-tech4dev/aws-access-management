@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Shared helpers for the fan-out scripts. Source it; don't run it.
-#
-# Inputs (environment):
-#   ACCOUNT_IDS    comma-separated account IDs under the OU
-#   ROLE_NAME      role to assume in each account (e.g. OrganizationAccountAccessRole)
-#   TARGET_REGION  region for STS/CLI calls (IAM itself is global)
-#
-# The caller's ambient AWS credentials must be able to sts:AssumeRole into
-# ROLE_NAME in every listed account.
-# ---------------------------------------------------------------------------
+# Shared account loop for the fan-out scripts (ACCOUNT_IDS, ROLE_NAME,
+# TARGET_REGION). Source it; see README, "How the fan-out works".
 set -uo pipefail
 
 : "${ACCOUNT_IDS:?}" "${ROLE_NAME:?}"
@@ -26,12 +17,8 @@ trap 'rm -rf "$WORK"' EXIT
 # Accounts the per-account function failed in (or that couldn't be assumed).
 FAILED=()
 
-# for_each_account <session-label> <function>
-#
-# Assumes ROLE_NAME in every account and runs <function> in a subshell with
-# that account's credentials and ACCOUNT_ID exported. The subshell runs with
-# `set -e`, so any failing command fails that account. A failure is recorded in
-# FAILED and the loop moves on to the next account.
+# for_each_account <session-label> <function>: run <function> in each account
+# with its credentials and ACCOUNT_ID; record failures in FAILED and continue.
 for_each_account() {
   local label="$1" fn="$2" account creds rc
   local -a accounts

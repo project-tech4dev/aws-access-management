@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Upsert one platform role in every target account. Invoked by Terraform
-# (terraform_data.platform_roles["<role>"]).
-#
-# Platform roles carry NO permissions boundary. Delegation holders can't create
-# or modify them (validation keeps their names outside every delegated prefix);
-# a delegation can only let its holders PASS them to named services.
-#
-# Inputs (environment), in addition to those in lib.sh:
-#   ROLE_MANIFEST  JSON object {"name", "description", "trust_policy",
-#                  "managed_policy_arns": [...]}. The __ACCOUNT_ID__ token in
-#                  the trust policy and ARNs is replaced with each account's ID.
-#
-# Idempotent: an existing role gets its trust policy reset and the managed
-# policies (re-)attached. Extra policies attached by hand are left alone.
-# Never deletes roles - see the note on terraform_data.platform_roles.
-# ---------------------------------------------------------------------------
+# Create or update one platform role (ROLE_MANIFEST) in every target account.
+# Run by terraform_data.platform_roles; see README, "How the fan-out works".
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 : "${ROLE_MANIFEST:?}"

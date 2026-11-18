@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Run `terraform plan -out=tfplan` without printing the plan, and report only
-# which resources change and how (logs of a public repository are public).
-#
-# Writes to $GITHUB_OUTPUT:  digest=<sha256 of the sorted "action address" list>,
-#                            empty when nothing changes. A digest, not the list:
-#                            addresses contain masked values (account IDs, group
-#                            names), and GitHub drops job outputs that do.
-# Writes to $GITHUB_STEP_SUMMARY: the same list as a table.
-# Run from accounts/.
-# ---------------------------------------------------------------------------
+# Plan without printing the plan; report changed resources and their digest.
+# See README, "GitHub repository and workflow". Run from accounts/.
 set -euo pipefail
 
 if ! terraform plan -no-color -lock-timeout=5m -out=tfplan > plan.log 2>&1; then

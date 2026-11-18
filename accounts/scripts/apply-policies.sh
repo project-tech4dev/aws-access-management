@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# Upsert one delegation's customer-managed policies (role boundary, optional
-# permission-set boundary, delegation policy) in every target account.
-# Invoked by Terraform (terraform_data.delegated_iam_policies["<delegation>"]).
-#
-# Inputs (environment), in addition to those in lib.sh:
-#   MANIFEST  JSON array of {"name": ..., "document": ...}, in creation order.
-#             Documents are rendered by Terraform; the __ACCOUNT_ID__ token is
-#             replaced here with each account's ID.
-#
-# Idempotent: an existing policy gets a new default version; it is never
-# deleted here. Safe to re-run after fixing access to an unreachable account.
-# ---------------------------------------------------------------------------
+# Create or update one delegation's policies (MANIFEST) in every target account.
+# Run by terraform_data.delegated_iam_policies; see README, "How the fan-out works".
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 : "${MANIFEST:?}"
