@@ -44,9 +44,7 @@ runs:
         TFVARS: ${{ inputs.tfvars }}
       run: printf '%s' "$TFVARS" | base64 -d > terraform.tfvars
 
-    # account_assignments and delegations are repository variables, so they can
-    # be read and edited in GitHub; neither is committed, as the repository may
-    # be public. Terraform loads *.auto.tfvars automatically.
+    # From repository variables; see README, "Changing access".
     - name: Write account_assignments.auto.tfvars and delegations.auto.tfvars
       shell: bash
       working-directory: accounts
@@ -62,7 +60,6 @@ runs:
             exit 1
           fi
           printf '%s\n' "$value" > "$1.auto.tfvars"
-          # Each may set only its own variable, or it would override another.
           if other="$(grep -E '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*=' "$1.auto.tfvars" | grep -vE "^$1[[:space:]]*=")"; then
             echo "::error::$2 may only set $1, but it also sets: ${other%%=*}"
             exit 1
@@ -75,8 +72,7 @@ runs:
         write account_assignments TF_ACCOUNT_ASSIGNMENTS
         write delegations TF_DELEGATIONS
 
-    # Logs of a public repository are public. Mask every identifier of the
-    # organization that Terraform or the fan-out scripts might print.
+    # Logs of a public repository are public.
     - name: Mask organization identifiers
       shell: bash
       working-directory: accounts
@@ -90,7 +86,6 @@ runs:
         for instance in $(aws sso-admin list-instances --query 'Instances[].InstanceArn' --output text); do
           mask "${instance##*/}"
           mask $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text)
-          # Group and user names appear in account assignment addresses.
           for store in $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text); do
             while IFS=$'\t' read -r id name; do mask "$id" "$name"; done < <(
               aws identitystore list-groups --identity-store-id "$store" --query 'Groups[].[GroupId,DisplayName]' --output text)
@@ -102,8 +97,6 @@ runs:
           done
         done
 
-    # Delegations hold nothing sensitive: show them, so a run isn't blind. The
-    # assignments are left out (their IDs and group names are masked anyway).
     - name: Show delegations
       shell: bash
       working-directory: accounts

@@ -473,6 +473,16 @@ pinned to one account. So `terraform_data` resources run scripts that assume
 - If any account fails, the script still processes the others, then exits
   non-zero and the apply fails. Fix the cause and apply again.
 - Scripts need `aws` and `jq` (preinstalled on GitHub's `ubuntu-latest` runners).
+- Every script is idempotent and safe to re-run. None deletes anything except
+  `destroy-policies.sh` (see [Teardown](#teardown)).
+
+| Script | Input (environment) | In each account |
+|---|---|---|
+| `lib.sh` (sourced) | `ACCOUNT_IDS` (comma-separated), `ROLE_NAME` (execution role), `TARGET_REGION` | Assumes `ROLE_NAME` and runs the script's step with that account's credentials and `ACCOUNT_ID`. The caller must be able to assume `ROLE_NAME` in every account. |
+| `apply-policies.sh` | `MANIFEST`: JSON array of `{name, document}`, in creation order | Creates each policy, or adds a new default version to an existing one. At IAM's 5-version limit, it first deletes the oldest non-default version. |
+| `apply-platform-roles.sh` | `ROLE_MANIFEST`: JSON `{name, description, trust_policy, managed_policy_arns}` | Creates the role, or resets its trust policy. Attaches the managed policies and leaves extra ones attached by hand. |
+| `apply-github-oidc.sh` | none | Creates the OIDC provider, or adds the `sts.amazonaws.com` audience to an existing one. |
+| `destroy-policies.sh` | `POLICY_NAMES`: JSON array, in creation order | Deletes the policies in reverse order. A policy still attached (also as a boundary) is left in place with a warning. Any other error fails the run, so Terraform retries. |
 
 ### Delegations
 
@@ -618,7 +628,7 @@ ones named. Each is idempotent:
 |---|---|
 | `preflight` | Checks tools, the `gh` login and scopes, and that the AWS credentials are for the management account. |
 | `repo` | Creates the repository; squash merges only; deletes branches on merge. |
-| `teams` | `GH_TEAM`: every org member except owners, with Write. `GH_APPROVER_TEAM`: only the approvers, with Write. |
+| `teams` | `GH_TEAM`: every org member except owners (they already have admin access), with Write. Only new members are added: re-adding one would reset their team role. `GH_APPROVER_TEAM`: only the approvers, with Write; anyone else is removed, because this team may bypass review. |
 | `actions` | Read-only `GITHUB_TOKEN` that can't approve pull requests; fork workflows wait for approval. |
 | `code` | Writes `.github/CODEOWNERS` (the approvers); first push to an empty repository. |
 | `aws` | GitHub OIDC provider and the plan/apply roles in the management account. |
@@ -645,14 +655,21 @@ and the repository's Actions variables, where the `variables` step stores them:
 | `EXECUTION_ROLE_NAME` | `OrganizationAccountAccessRole` | Role the fan-out assumes. |
 | `ROLE_NAME_PREFIX` | `github-<repo>` | Names of the plan and apply IAM roles. |
 | `STATE_BUCKET` | `bootstrap/state-bucket` output | Not stored as a variable (it's a secret). |
-| `TFVARS_FILE` | `accounts/terraform.tfvars` | Source of the `TFVARS_BASE64` secret. |
+| `TFVARS_FILE` | `accounts/terraform.tfvars` | Source of the `TFVARS_BASE64` secret and the `TF_*` access variables. Not stored. |
+| `OVERWRITE_ACCESS` | unset | `1` lets the `access` step replace a variable edited in GitHub. Not stored. |
+| `COMMIT_MESSAGE` | `Initial import` | Message of the first commit (`code` step). Not stored. |
+
+The tfvars secret is base64-encoded so it is one line. GitHub masks a
+multi-line secret line by line, which would also mask unrelated log text such
+as a lone `}`.
 
 **AWS roles for the workflow** (management account):
 
 - `<prefix>-plan`: read-only Organizations and Identity Center access, state
-  read and lock. Trusted by pull requests and `main` of this repository.
+  read and lock, and Identity Store reads (group and user lookups). Trusted by
+  pull requests and `main` of this repository.
 - `<prefix>-apply`: plan's access, plus state write, RCP management,
-  permission-set attachments, and assuming `execution_role_name` in accounts
+  permission-set attachments, account assignments, and assuming `execution_role_name` in accounts
   of this organization only. Trusted only by jobs in the `production`
   environment.
 
@@ -666,8 +683,8 @@ repository can't match.
 | File | Purpose |
 |---|---|
 | `.github/workflows/terraform.yml` | Jobs `plan` (pull requests), `plan-main` and `apply` (`main`). |
-| `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, masking of organization IDs, `terraform.tfvars` from the secret, `terraform init`. |
-| `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. |
+| `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, `terraform.tfvars` from the secret, the `*.auto.tfvars` files from the `TF_*` variables, masking of organization identifiers, the delegations in the log, `terraform init`. |
+| `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. Its job output is a SHA-256 digest of that list, empty when nothing changes; `apply` compares digests. A digest, because GitHub drops job outputs that contain masked values. |
 | `.github/CODEOWNERS` | Makes the approvers the required reviewers. |
 
 ### Files in `accounts/`
