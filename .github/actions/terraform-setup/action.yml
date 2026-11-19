@@ -1,12 +1,9 @@
 name: terraform-setup
 description: >
-  Install Terraform, assume an AWS role via OIDC, mask organization identifiers
-  in the logs, write terraform.tfvars and the *.auto.tfvars files, and run
-  terraform init (in accounts/).
+  Install Terraform, write terraform.tfvars and the *.auto.tfvars files, and
+  run terraform init (in accounts/). Run aws-login first.
 
 inputs:
-  role-to-assume:
-    required: true
   aws-region:
     required: true
   state-bucket:
@@ -31,18 +28,15 @@ runs:
         terraform_version: ${{ inputs.terraform-version }}
         terraform_wrapper: false
 
-    - uses: aws-actions/configure-aws-credentials@v5
-      with:
-        role-to-assume: ${{ inputs.role-to-assume }}
-        aws-region: ${{ inputs.aws-region }}
-        mask-aws-account-id: true
-
     - name: Write terraform.tfvars
       shell: bash
       working-directory: accounts
       env:
         TFVARS: ${{ inputs.tfvars }}
-      run: printf '%s' "$TFVARS" | base64 -d > terraform.tfvars
+      # Also mask any account or OU IDs in the decoded file.
+      run: |
+        printf '%s' "$TFVARS" | base64 -d > terraform.tfvars
+        grep -oE '\b([0-9]{12}|ou-[a-z0-9]+-[a-z0-9]+|r-[a-z0-9]+)\b' terraform.tfvars | sort -u | sed 's/^/::add-mask::/' || true
 
     # From repository variables; see README, "Changing access".
     - name: Write account_assignments.auto.tfvars and delegations.auto.tfvars
@@ -71,31 +65,6 @@ runs:
         }
         write account_assignments TF_ACCOUNT_ASSIGNMENTS
         write delegations TF_DELEGATIONS
-
-    # Logs of a public repository are public.
-    - name: Mask organization identifiers
-      shell: bash
-      working-directory: accounts
-      run: |
-        set -euo pipefail
-        mask() { local v; for v in "$@"; do if [ -n "$v" ] && [ "$v" != None ]; then echo "::add-mask::$v"; fi; done; }
-        mask $(aws organizations list-accounts --query 'Accounts[].Id' --output text)
-        mask "$(aws organizations describe-organization --query Organization.Id --output text)"
-        mask $(aws organizations list-roots --query 'Roots[].Id' --output text)
-        mask $(grep -oE '\b(ou-[a-z0-9]+-[a-z0-9]+|r-[a-z0-9]+)\b' terraform.tfvars || true)
-        for instance in $(aws sso-admin list-instances --query 'Instances[].InstanceArn' --output text); do
-          mask "${instance##*/}"
-          mask $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text)
-          for store in $(aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text); do
-            while IFS=$'\t' read -r id name; do mask "$id" "$name"; done < <(
-              aws identitystore list-groups --identity-store-id "$store" --query 'Groups[].[GroupId,DisplayName]' --output text)
-            while IFS=$'\t' read -r id name; do mask "$id" "$name"; done < <(
-              aws identitystore list-users --identity-store-id "$store" --query 'Users[].[UserId,UserName]' --output text)
-          done
-          for ps in $(aws sso-admin list-permission-sets --instance-arn "$instance" --query 'PermissionSets[]' --output text); do
-            mask "${ps##*/}"
-          done
-        done
 
     - name: Show delegations
       shell: bash

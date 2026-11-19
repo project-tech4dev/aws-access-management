@@ -10,7 +10,7 @@ on:
     paths:
       - "accounts/**"
       - ".github/workflows/terraform.yml"
-      - ".github/actions/terraform-setup/**"
+      - ".github/actions/**"
       - ".github/scripts/**"
   workflow_dispatch:
 
@@ -47,9 +47,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/terraform-setup
+      # Masks org identifiers before the next step's inputs are logged.
+      - uses: ./.github/actions/aws-login
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: ./.github/actions/terraform-setup
+        with:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
@@ -75,9 +80,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/terraform-setup
+      # Masks org identifiers before the next step's inputs are logged.
+      - uses: ./.github/actions/aws-login
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: ./.github/actions/terraform-setup
+        with:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
@@ -97,9 +107,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/terraform-setup
+      # Masks org identifiers before the next step's inputs are logged.
+      - uses: ./.github/actions/aws-login
         with:
           role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: ./.github/actions/terraform-setup
+        with:
           aws-region: ${{ vars.AWS_REGION }}
           state-bucket: ${{ secrets.TF_STATE_BUCKET }}
           tfvars: ${{ secrets.TFVARS_BASE64 }}
