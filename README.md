@@ -242,7 +242,12 @@ in `accounts/terraform.tfvars`.
 2. Editing a variable doesn't start a run. Run the workflow on `main` by hand
    (**Actions → terraform (accounts) → Run workflow**), check the plan, then
    approve the apply. Each run prints the delegations in its log and job
-   summary. The assignments' account IDs and group names are masked there.
+   summary. The assignments' account IDs, OU IDs and group and user names
+   are masked there, because the masks come from AWS. A name that isn't in
+   Identity Center can't be masked: create the group in Google (email
+   `awsaccess-…`) and wait for the sync to bring it into Identity Center
+   before you add it here. Otherwise that name shows in the log and
+   the plan fails with "GROUP not found".
 
 An edit has no review and no history, and it takes effect on the next run.
 Copy the old value before you change it. Variables are not secrets: anyone who
@@ -683,7 +688,8 @@ repository can't match.
 | File | Purpose |
 |---|---|
 | `.github/workflows/terraform.yml` | Jobs `plan` (pull requests), `plan-main` and `apply` (`main`). |
-| `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, `terraform.tfvars` from the secret, the `*.auto.tfvars` files from the `TF_*` variables, masking of organization identifiers, the delegations in the log, `terraform init`. |
+| `.github/actions/aws-login/` | Assumes the AWS role, then masks every account, OU, root and organization ID, and every Identity Center group and user name, read from AWS. It runs before `terraform-setup`, because GitHub logs a step's inputs in clear text and a mask hides only later output. |
+| `.github/actions/terraform-setup/` | Terraform, `terraform.tfvars` from the secret, the `*.auto.tfvars` files from the `TF_*` variables, the delegations in the log, `terraform init`. |
 | `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. Its job output is a SHA-256 digest of that list, empty when nothing changes; `apply` compares digests. A digest, because GitHub drops job outputs that contain masked values. |
 | `.github/CODEOWNERS` | Makes the approvers the required reviewers. |
 
