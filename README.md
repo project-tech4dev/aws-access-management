@@ -242,7 +242,12 @@ in `accounts/terraform.tfvars`.
 2. Editing a variable doesn't start a run. Run the workflow on `main` by hand
    (**Actions → terraform (accounts) → Run workflow**), check the plan, then
    approve the apply. Each run prints the delegations in its log and job
-   summary. The assignments' account IDs and group names are masked there.
+   summary. The assignments' account IDs, OU IDs and group and user names
+   are masked there, because the masks come from AWS. A name that isn't in
+   Identity Center can't be masked: create the group in Google (email
+   `awsaccess-…`) and wait for the sync to bring it into Identity Center
+   before you add it here. Otherwise that name shows in the log and
+   the plan fails with "GROUP not found".
 
 An edit has no review and no history, and it takes effect on the next run.
 Copy the old value before you change it. Variables are not secrets: anyone who
@@ -250,8 +255,10 @@ can run a modified workflow in the repository can print them.
 
 Keep your local file and the variables the same. `setup.sh access` sets each
 variable from its block in the file. If a variable differs, for example after
-an edit in GitHub, it shows the difference and keeps the GitHub value. Copy that
-value into your file, or re-run with `OVERWRITE_ACCESS=1` to replace it:
+an edit in GitHub, it shows the difference and asks whether to replace the
+GitHub value. If you answer no, it keeps the GitHub value and warns at the end;
+copy that value into your file. Without a terminal it keeps the GitHub value
+unless `OVERWRITE_ACCESS=1` is set:
 
 ```bash
 GH_ORG=<github-org> GH_REPO=<repo> bootstrap/github/setup.sh access
@@ -635,7 +642,7 @@ ones named. Each is idempotent:
 | `environment` | `production`: an approver must approve; `main` only; admins can't bypass. |
 | `variables` | Stores the settings below as repository Actions variables. |
 | `secrets` | `AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `TFVARS_BASE64` (repository); `AWS_APPLY_ROLE_ARN` (environment); variable `AWS_REGION`. |
-| `access` | Sets `TF_ACCOUNT_ASSIGNMENTS` and `TF_DELEGATIONS` from the `account_assignments` and `delegations` blocks of `terraform.tfvars`. A variable that differs (edited in GitHub) is replaced only with `OVERWRITE_ACCESS=1`. |
+| `access` | Sets `TF_ACCOUNT_ASSIGNMENTS` and `TF_DELEGATIONS` from the `account_assignments` and `delegations` blocks of `terraform.tfvars`. If a variable differs (edited in GitHub), it shows the difference and asks before replacing it. |
 | `rulesets` | On `main`: pull request and passing `plan` check for everyone, no bypass; code-owner review, which `GH_APPROVER_TEAM` may bypass only when merging a pull request. |
 
 **Settings** are read, in order of priority, from environment variables,
@@ -656,7 +663,7 @@ and the repository's Actions variables, where the `variables` step stores them:
 | `ROLE_NAME_PREFIX` | `github-<repo>` | Names of the plan and apply IAM roles. |
 | `STATE_BUCKET` | `bootstrap/state-bucket` output | Not stored as a variable (it's a secret). |
 | `TFVARS_FILE` | `accounts/terraform.tfvars` | Source of the `TFVARS_BASE64` secret and the `TF_*` access variables. Not stored. |
-| `OVERWRITE_ACCESS` | unset | `1` lets the `access` step replace a variable edited in GitHub. Not stored. |
+| `OVERWRITE_ACCESS` | unset | `1` makes the `access` step replace a differing variable without asking. Not stored. |
 | `COMMIT_MESSAGE` | `Initial import` | Message of the first commit (`code` step). Not stored. |
 
 The tfvars secret is base64-encoded so it is one line. GitHub masks a
@@ -683,7 +690,8 @@ repository can't match.
 | File | Purpose |
 |---|---|
 | `.github/workflows/terraform.yml` | Jobs `plan` (pull requests), `plan-main` and `apply` (`main`). |
-| `.github/actions/terraform-setup/` | Shared setup: Terraform, AWS role, `terraform.tfvars` from the secret, the `*.auto.tfvars` files from the `TF_*` variables, masking of organization identifiers, the delegations in the log, `terraform init`. |
+| `.github/actions/aws-login/` | Assumes the AWS role, then masks every account, OU, root and organization ID, and every Identity Center group and user name, read from AWS. It runs before `terraform-setup`, because GitHub logs a step's inputs in clear text and a mask hides only later output. |
+| `.github/actions/terraform-setup/` | Terraform, `terraform.tfvars` from the secret, the `*.auto.tfvars` files from the `TF_*` variables, the delegations in the log, `terraform init`. |
 | `.github/scripts/plan-summary.sh` | Plans without printing the plan; reports only resource addresses and actions. Its job output is a SHA-256 digest of that list, empty when nothing changes; `apply` compares digests. A digest, because GitHub drops job outputs that contain masked values. |
 | `.github/CODEOWNERS` | Makes the approvers the required reviewers. |
 

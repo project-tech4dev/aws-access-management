@@ -372,10 +372,11 @@ tfvars_without_access() { # $1 = file: print everything except the blocks
   ' "$1"
 }
 
-# Set TF_* from TFVARS_FILE; keep a value edited in GitHub unless OVERWRITE_ACCESS=1.
+# Set TF_* from TFVARS_FILE; ask before replacing a value that differs in GitHub.
+KEPT_ACCESS=()
 step_access() {
   say "access"
-  local name var file="$ROOT/$TFVARS_FILE" local_value current
+  local name var file="$ROOT/$TFVARS_FILE" local_value current answer
   for name in "${ACCESS_BLOCKS[@]}"; do
     var="TF_$(tr '[:lower:]' '[:upper:]' <<< "$name")"
     local_value="$(tfvars_block "$name" "$file")"
@@ -387,8 +388,15 @@ step_access() {
       fi
       echo "$var differs from $file (- GitHub, + local):"
       diff <(printf '%s\n' "$current") <(printf '%s\n' "$local_value") || true
-      if [ "${OVERWRITE_ACCESS:-}" != 1 ]; then
-        echo "kept the GitHub value; re-run with OVERWRITE_ACCESS=1 to replace it, or copy it into $file"
+      answer=n
+      if [ "${OVERWRITE_ACCESS:-}" = 1 ]; then
+        answer=y
+      elif [ -t 0 ]; then
+        read -r -p "Replace $var in GitHub with your local block? [y/N] " answer
+      fi
+      if [[ "$answer" != [yY]* ]]; then
+        echo "kept the GitHub value of $var"
+        KEPT_ACCESS+=("$var")
         continue
       fi
     fi
@@ -463,3 +471,7 @@ for s in "${STEPS[@]}"; do
 done
 for s in "${STEPS[@]}"; do "step_$s"; done
 say "done"
+if [ "${#KEPT_ACCESS[@]}" -gt 0 ]; then
+  echo "WARNING: kept the GitHub value of ${KEPT_ACCESS[*]}, which differs from $TFVARS_FILE." >&2
+  echo "  Copy it into $TFVARS_FILE, or re-run 'setup.sh access' and answer y." >&2
+fi
